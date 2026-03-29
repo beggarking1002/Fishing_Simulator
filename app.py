@@ -2,71 +2,80 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Tuple
+from typing import Dict, List, Optional
+import random
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
 SECONDS_PER_DAY = 24 * 60 * 60
-
+HALF_TRIP_AT_V1 = 17.61 / 2.0
+RARITY_COLS = ["Trash", "Normal", "Fine", "Superior", "Rare", "Elite", "Fantastic", "Legendary"]
 DATA_FILE_STEMS = {
     "restaurant": "Restaurant_Data",
     "fishing": "Fishing_Data",
     "guest": "Guest_Data",
 }
+BASE_CUSTOMER_POOL = list(range(1, 15)) + [18, 19]
+SPECIAL_EXTRA_ORDER = [15, 16, 17]
+VIP_EXTRA_ORDER = [20]
 
 
 @dataclass
-class SimResult:
-    catches_per_day: float
-    fish_value_per_catch: float
-    total_fish_value: float
-    dish_count: float
-    sales_capacity: float
-    realized_sales: float
+class CustomerProfile:
+    customer_id: int
+    grade: str
+    weight: float
+    flow_velocity: float
+    first_order_time: float
+    first_eat_time: float
+    second_order_rate: float
+    second_order_time: float
+    second_eat_time: float
+    third_order_rate: float
+    third_order_time: float
+    third_eat_time: float
+    tips_rate: float
+    tips_multi: float
+
+
+class SeatState:
+    def __init__(self) -> None:
+        self.phase = "ready_for_spawn"
+        self.timer = 0.0
+        self.customer: Optional[CustomerProfile] = None
+        self.orders_completed = 0
+
+
+@dataclass
+class SimSummary:
+    fish_caught: int
+    fishing_sessions: int
+    tickets_spent: int
+    fish_left_in_inventory: int
+    dishes_cooked: int
+    dishes_sold: int
     gross_sales: float
-    tips: float
-    total_revenue: float
+    tips_sales: float
+    total_sales: float
+    customers_spawned: int
+    customers_completed: int
+    special_spawned: int
+    vip_spawned: int
+    peak_fish_inventory: int
+    peak_dish_stock: int
+    remaining_tickets: int
+    remaining_dishes: int
+    restaurant_idle_seconds: int
     bottleneck: str
-    spawn_per_day: float
-    avg_customer_cycle: float
-    seat_capacity_per_day: float
+    active_rate_id: str
+    rarity_breakdown: pd.DataFrame
+    fish_breakdown: pd.DataFrame
+    recipe_breakdown: pd.DataFrame
 
 
-# ---------- Loading helpers ----------
-
-def clean_table(df: pd.DataFrame) -> pd.DataFrame:
-    """Use the first row as header, drop the Korean description/type rows, and remove empty rows."""
-    out = df.copy()
-    out.columns = [str(c).strip() for c in out.iloc[0].tolist()]
-    out = out.iloc[1:].reset_index(drop=True)
-    out = out.dropna(how="all")
-
-    # Remove rows that are likely description/type rows.
-    kill_tokens = {
-        "분류", "레벨", "비용", "등급", "이름", "Int", "Float", "Enum", "String",
-        "string", "int", "float", "enum", "자료형", "계산 방식", "아이디", "텍스트 ID",
-    }
-
-    def row_is_meta(row: pd.Series) -> bool:
-        vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
-        if not vals:
-            return True
-        if all(v in kill_tokens for v in vals):
-            return True
-        return False
-
-    out = out.loc[~out.apply(row_is_meta, axis=1)].reset_index(drop=True)
-    return out
-
-
-def find_data_file(base: Path, stem: str) -> Path:
-    candidates = sorted(base.glob(f"{stem}*.xlsx")) + sorted(base.glob(f"{stem}*.xls")) + sorted(base.glob(f"{stem}*.ods"))
-    if not candidates:
-        raise FileNotFoundError(f"'{stem}'로 시작하는 xlsx/xls/ods 파일을 찾을 수 없습니다: {base}")
-    return candidates[0]
-
+# ---------------- data loading ----------------
 
 def read_table(file_path: Path, sheet_name: str) -> pd.DataFrame:
     suffix = file_path.suffix.lower()
@@ -74,38 +83,66 @@ def read_table(file_path: Path, sheet_name: str) -> pd.DataFrame:
     return pd.read_excel(file_path, sheet_name=sheet_name, engine=engine, header=None)
 
 
-@st.cache_data
+def find_data_file(base: Path, stem: str) -> Path:
+    candidates = sorted(base.glob(f"{stem}*.xlsx")) + sorted(base.glob(f"{stem}*.xls")) + sorted(base.glob(f"{stem}*.ods"))
+    if not candidates:
+        raise FileNotFoundError(f"{stem}로 시작하는 데이터 파일을 찾지 못했습니다: {base}")
+    return candidates[0]
 
+
+def clean_table(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out.columns = [str(c).strip() for c in out.iloc[0].tolist()]
+    out = out.iloc[1:].reset_index(drop=True)
+    out = out.dropna(how="all")
+
+    first_col_values_to_drop = {
+        "분류", "아이디", "손님 ID", "등급", "이름", "설거지 소요 시간", "Upgrade_Type", "Recipe_ID", "Fish_ID",
+    }
+    row_tokens_to_drop = {
+        "분류", "레벨", "비용", "등급", "이름", "Int", "Float", "Enum", "String", "string", "int", "float", "enum",
+        "자료형", "계산 방식", "아이디", "텍스트 ID", "다음단계필요재화", "값", "참조아이디", "효과 값 1", "효과 값 2",
+        "설거지 소요 시간", "최소 입장 딜레이", "최대 입장 딜레이", "한글 이름", "영어 이름", "가중치", "출입 속도",
+        "첫 번째 주문 시간", "첫 번째 먹는 시간", "두 번째 주문 확률", "두 번째 주문 시간", "두 번째 먹는 시간",
+        "세 번째 주문 확률", "세 번째 주문 시간", "세 번째 먹는 시간", "팁 확률", "팁 배수", "정가", "생산량", "재료",
+    }
+
+    def is_meta_row(row: pd.Series) -> bool:
+        vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
+        if not vals:
+            return True
+        if str(row.iloc[0]).strip() in first_col_values_to_drop:
+            return True
+        return all(v in row_tokens_to_drop for v in vals)
+
+    out = out.loc[~out.apply(is_meta_row, axis=1)].reset_index(drop=True)
+    return out.replace({np.nan: None})
+
+
+@st.cache_data
 def load_all_data(base_dir: str) -> Dict[str, pd.DataFrame]:
     base = Path(base_dir)
-    tables: Dict[str, pd.DataFrame] = {}
-
     restaurant_file = find_data_file(base, DATA_FILE_STEMS["restaurant"])
     fishing_file = find_data_file(base, DATA_FILE_STEMS["fishing"])
     guest_file = find_data_file(base, DATA_FILE_STEMS["guest"])
 
-    tables["restaurant_upg"] = clean_table(read_table(restaurant_file, "Restaurant_UPG_Data"))
-    tables["restaurant_settings"] = clean_table(read_table(restaurant_file, "Restaurant_UPG_Setting"))
-    tables["recipes"] = clean_table(read_table(restaurant_file, "Recipe_Data"))
-
-    tables["fishing_upg"] = clean_table(read_table(fishing_file, "Fishing_UPG_Data"))
-    tables["fishing_settings"] = clean_table(read_table(fishing_file, "Fishing_UPG_Setting"))
-    tables["rates"] = clean_table(read_table(fishing_file, "Fishing_Rate_Data"))
-    tables["fish"] = clean_table(read_table(fishing_file, "Fish_Data"))
-
-    tables["fixed"] = clean_table(read_table(guest_file, "Fixed_Value"))
-    tables["guest_actions"] = clean_table(read_table(guest_file, "Customer_Action"))
-    tables["guest_tips"] = clean_table(read_table(guest_file, "Customer_Tips"))
-
-    for key, df in tables.items():
-        tables[key] = df.replace({np.nan: None})
-
-    return tables
+    return {
+        "restaurant_upg": clean_table(read_table(restaurant_file, "Restaurant_UPG_Data")),
+        "restaurant_settings": clean_table(read_table(restaurant_file, "Restaurant_UPG_Setting")),
+        "recipes": clean_table(read_table(restaurant_file, "Recipe_Data")),
+        "fishing_upg": clean_table(read_table(fishing_file, "Fishing_UPG_Data")),
+        "fishing_settings": clean_table(read_table(fishing_file, "Fishing_UPG_Setting")),
+        "rates": clean_table(read_table(fishing_file, "Fishing_Rate_Data")),
+        "fish": clean_table(read_table(fishing_file, "Fish_Data")),
+        "fixed": clean_table(read_table(guest_file, "Fixed_Value")),
+        "guest_actions": clean_table(read_table(guest_file, "Customer_Action")),
+        "guest_tips": clean_table(read_table(guest_file, "Customer_Tips")),
+    }
 
 
-# ---------- Data extraction ----------
+# ---------------- helpers ----------------
 
-def to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+def to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     out = df.copy()
     for col in cols:
         if col in out.columns:
@@ -113,222 +150,469 @@ def to_numeric(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return out
 
 
-def build_upgrade_level_lookup(upg_df: pd.DataFrame, max_only_settings: pd.DataFrame) -> Dict[str, Tuple[int, int]]:
+def get_upgrade_ranges(upg_df: pd.DataFrame, settings_df: pd.DataFrame) -> Dict[str, tuple[int, int]]:
+    settings_df = to_numeric(settings_df, ["Max_Level"])
+    max_from_settings = settings_df.set_index("Upgrade_Type")["Max_Level"].dropna().astype(int).to_dict()
     upg_df = to_numeric(upg_df, ["Level"])
-    settings = to_numeric(max_only_settings, ["Max_Level"])
     max_from_data = upg_df.groupby("Upgrade_Type")["Level"].max().dropna().astype(int).to_dict()
-    max_from_settings = settings.set_index("Upgrade_Type")["Max_Level"].dropna().astype(int).to_dict()
-    all_keys = sorted(set(max_from_data) | set(max_from_settings))
-    return {k: (1, int(max(max_from_data.get(k, 1), max_from_settings.get(k, 1)))) for k in all_keys}
+    keys = sorted(set(max_from_settings) | set(max_from_data))
+    return {k: (1, int(max(max_from_settings.get(k, 1), max_from_data.get(k, 1)))) for k in keys}
 
 
-def get_upgrade_value(df: pd.DataFrame, upgrade_type: str, level: int, value_col: str) -> float:
-    dfn = to_numeric(df, ["Level", value_col])
+def get_upgrade_value(upg_df: pd.DataFrame, upgrade_type: str, level: int, preferred: str) -> float:
+    dfn = to_numeric(upg_df, ["Level", "Effect_Value_Int", "Effect_Value_Float"])
     row = dfn[(dfn["Upgrade_Type"] == upgrade_type) & (dfn["Level"] == level)]
     if row.empty:
-        row = dfn[dfn["Upgrade_Type"] == upgrade_type].sort_values("Level")
-        if row.empty:
+        group = dfn[dfn["Upgrade_Type"] == upgrade_type].sort_values("Level")
+        if group.empty:
             return 0.0
-        return float(row.iloc[-1][value_col])
-    return float(row.iloc[0][value_col])
+        row = group.tail(1)
+    value = row.iloc[0].get(preferred)
+    if pd.notna(value):
+        return float(value)
+    fallback = "Effect_Value_Float" if preferred == "Effect_Value_Int" else "Effect_Value_Int"
+    value = row.iloc[0].get(fallback)
+    if pd.notna(value):
+        return float(value)
+    return 0.0
 
 
-def get_rate_id_for_player_grade(df: pd.DataFrame, level: int) -> str:
-    row = df[(df["Upgrade_Type"] == "PlayerGrade")].copy()
-    row["Level"] = pd.to_numeric(row["Level"], errors="coerce")
-    row = row[row["Level"] == level]
+def clamp_levels(levels: Dict[str, int]) -> Dict[str, int]:
+    out = dict(levels)
+    player_grade = int(out.get("PlayerGrade", 1))
+    fishing_cap = max(1, (player_grade + 1) // 2)
+    for key in ["BaitMaking", "FishingRod", "Ship"]:
+        if key in out:
+            out[key] = min(out[key], fishing_cap)
+
+    master = int(out.get("Master_Lv", 1))
+    for key in [
+        "Max_Customer_Limit", "Max_Spawn_Limit_1", "Max_Spawn_Limit_2", "Weight", "Bonus_Tips_Multi",
+        "Bonus_Dish_Price_1", "Bonus_Dish_Price_2", "Bonus_Food_1", "Bonus_Food_2",
+    ]:
+        if key in out:
+            out[key] = min(out[key], master)
+    return out
+
+
+def get_rate_id_for_player_grade(fishing_upg_df: pd.DataFrame, player_grade: int) -> str:
+    dfn = fishing_upg_df.copy()
+    dfn["Level"] = pd.to_numeric(dfn["Level"], errors="coerce")
+    row = dfn[(dfn["Upgrade_Type"] == "PlayerGrade") & (dfn["Level"] == player_grade)]
     if row.empty:
-        all_rows = df[df["Upgrade_Type"] == "PlayerGrade"].copy()
-        all_rows["Level"] = pd.to_numeric(all_rows["Level"], errors="coerce")
-        all_rows = all_rows.sort_values("Level")
-        return str(all_rows.iloc[-1]["Rate_ID"])
+        row = dfn[dfn["Upgrade_Type"] == "PlayerGrade"].sort_values("Level").tail(1)
     return str(row.iloc[0]["Rate_ID"])
 
 
-def expected_fish_value_per_catch(fish_df: pd.DataFrame, rate_df: pd.DataFrame, rate_id: str) -> float:
-    fish = to_numeric(fish_df, ["Price"])
-    rarity_prices = fish.groupby("Rarity")["Price"].mean().to_dict()
-    rate_row = rate_df[rate_df["Gacha_Group_ID"] == rate_id]
-    if rate_row.empty:
+def normalize_rate(p: float) -> float:
+    if pd.isna(p):
         return 0.0
-    row = rate_row.iloc[0].to_dict()
-    total = 0.0
-    for rarity, avg_price in rarity_prices.items():
-        pct = pd.to_numeric(row.get(rarity), errors="coerce")
-        if pd.isna(pct):
-            continue
-        total += avg_price * (float(pct) / 100.0)
-    return total
+    p = float(p)
+    return p / 100.0 if p > 1.0 else p
 
 
-def recipe_value_per_fish(recipes_df: pd.DataFrame, fish_df: pd.DataFrame) -> float:
-    recipes = to_numeric(recipes_df, ["Price", "Yield"])
-    fish = to_numeric(fish_df, ["Price"])
-    fish_price_map = fish.set_index("Fish_ID")["Price"].to_dict()
-    vals = []
-    for _, row in recipes.iterrows():
-        ingredient = row.get("Ingredient")
-        recipe_price = pd.to_numeric(row.get("Price"), errors="coerce")
-        recipe_yield = pd.to_numeric(row.get("Yield"), errors="coerce")
-        if pd.isna(recipe_price) or pd.isna(recipe_yield) or ingredient not in fish_price_map:
-            continue
-        fish_price = fish_price_map[ingredient]
-        # Use the dish's total sales value generated from one fish ingredient.
-        vals.append(float(recipe_price) * float(recipe_yield))
-    return float(np.mean(vals)) if vals else 0.0
+def build_fishing_maps(tables: Dict[str, pd.DataFrame]):
+    fish_df = to_numeric(tables["fish"], ["Price"])
+    fish_df["Fish_ID"] = fish_df["Fish_ID"].astype(str)
+    rates_df = to_numeric(tables["rates"], RARITY_COLS)
+
+    rate_map: Dict[str, np.ndarray] = {}
+    for _, row in rates_df.iterrows():
+        rate_id = str(row["Gacha_Group_ID"])
+        probs = np.array([float(row.get(col) or 0.0) for col in RARITY_COLS], dtype=float)
+        probs = probs / probs.sum() if probs.sum() > 0 else np.ones(len(RARITY_COLS)) / len(RARITY_COLS)
+        rate_map[rate_id] = probs
+
+    rarity_to_fish: Dict[str, List[str]] = {}
+    fish_rarity: Dict[str, str] = {}
+    for _, row in fish_df.iterrows():
+        fish_id = str(row["Fish_ID"])
+        rarity = str(row["Rarity"])
+        rarity_to_fish.setdefault(rarity, []).append(fish_id)
+        fish_rarity[fish_id] = rarity
+    return rate_map, rarity_to_fish, fish_rarity
 
 
-def weighted_guest_stats(actions_df: pd.DataFrame) -> dict:
-    numeric_cols = [
-        "Weight", "Flow_Velocity", "First_Order_Time", "First_Eat_Time", "Second_Order_Rate",
-        "Second_Order_Time", "Second_Eat_Time", "Third_Order_Rate", "Third_Order_Time", "Third_Eat_Time",
-    ]
-    act = to_numeric(actions_df, numeric_cols)
-    act = act.dropna(subset=["Weight"])
-    weights = act["Weight"].astype(float)
-    total_weight = weights.sum() if weights.sum() > 0 else 1.0
-
-    def wavg(col: str) -> float:
-        series = act[col].fillna(0).astype(float)
-        return float((series * weights).sum() / total_weight)
-
-    first_order = wavg("First_Order_Time")
-    first_eat = wavg("First_Eat_Time")
-    second_prob = wavg("Second_Order_Rate")
-    second_order = wavg("Second_Order_Time")
-    second_eat = wavg("Second_Eat_Time")
-    third_prob = wavg("Third_Order_Rate")
-    third_order = wavg("Third_Order_Time")
-    third_eat = wavg("Third_Eat_Time")
-    flow_velocity = wavg("Flow_Velocity")
-
-    expected_orders = 1.0 + second_prob + second_prob * third_prob
-    expected_cycle = (
-        first_order + first_eat
-        + second_prob * (second_order + second_eat)
-        + second_prob * third_prob * (third_order + third_eat)
+def build_recipe_maps(recipes_df: pd.DataFrame, levels: Dict[str, int], restaurant_upg_df: pd.DataFrame):
+    recipes_df = to_numeric(recipes_df, ["Price", "Yield"])
+    bonus_food = (
+        get_upgrade_value(restaurant_upg_df, "Bonus_Food_1", levels["Bonus_Food_1"], "Effect_Value_Int")
+        + get_upgrade_value(restaurant_upg_df, "Bonus_Food_2", levels["Bonus_Food_2"], "Effect_Value_Int")
+    )
+    price_bonus = (
+        get_upgrade_value(restaurant_upg_df, "Bonus_Dish_Price_1", levels["Bonus_Dish_Price_1"], "Effect_Value_Float")
+        + get_upgrade_value(restaurant_upg_df, "Bonus_Dish_Price_2", levels["Bonus_Dish_Price_2"], "Effect_Value_Float")
     )
 
-    return {
-        "expected_orders": expected_orders,
-        "expected_cycle": expected_cycle,
-        "avg_flow_velocity": flow_velocity,
-    }
+    fish_to_recipe: Dict[str, str] = {}
+    recipe_price: Dict[str, float] = {}
+    recipe_yield: Dict[str, int] = {}
+    for _, row in recipes_df.iterrows():
+        ingredient = str(row["Ingredient"])
+        recipe_id = str(row["Recipe_ID"])
+        base_price = float(row.get("Price") or 0.0)
+        base_yield = int(float(row.get("Yield") or 0.0))
+        fish_to_recipe[ingredient] = recipe_id
+        recipe_price[recipe_id] = base_price * (1.0 + price_bonus)
+        recipe_yield[recipe_id] = max(0, int(base_yield + bonus_food))
+    return fish_to_recipe, recipe_price, recipe_yield
 
 
-def weighted_tip_multiplier(actions_df: pd.DataFrame, tips_df: pd.DataFrame) -> float:
-    act = to_numeric(actions_df, ["Weight"])
-    act = act.dropna(subset=["Weight"])
-    tips = to_numeric(tips_df, ["Tips_Rate", "Tips_Multi"])
-    tip_map = tips.set_index("Grade")[["Tips_Rate", "Tips_Multi"]].to_dict("index")
-    total_weight = act["Weight"].astype(float).sum()
-    if total_weight <= 0:
-        return 0.0
-    acc = 0.0
-    for _, row in act.iterrows():
-        grade = row.get("Grade")
-        weight = float(row.get("Weight") or 0)
-        info = tip_map.get(grade, {"Tips_Rate": 0.0, "Tips_Multi": 0.0})
-        acc += weight * float(info.get("Tips_Rate") or 0) * float(info.get("Tips_Multi") or 0)
-    return acc / total_weight
+def build_customer_pool(tables: Dict[str, pd.DataFrame], levels: Dict[str, int]) -> List[CustomerProfile]:
+    actions = to_numeric(
+        tables["guest_actions"],
+        [
+            "Customer_ID", "Weight", "Flow_Velocity", "First_Order_Time", "First_Eat_Time", "Second_Order_Rate",
+            "Second_Order_Time", "Second_Eat_Time", "Third_Order_Rate", "Third_Order_Time", "Third_Eat_Time",
+        ],
+    )
+    tips = to_numeric(tables["guest_tips"], ["Tips_Rate", "Tips_Multi"])
+    tips_by_grade = {}
+    for _, row in tips.iterrows():
+        tips_by_grade[str(row["Grade"])] = {
+            "rate": normalize_rate(row.get("Tips_Rate") or 0.0),
+            "multi": float(row.get("Tips_Multi") or 0.0),
+        }
+
+    special_effect = int(get_upgrade_value(tables["restaurant_upg"], "Max_Spawn_Limit_1", levels["Max_Spawn_Limit_1"], "Effect_Value_Int"))
+    vip_effect = int(get_upgrade_value(tables["restaurant_upg"], "Max_Spawn_Limit_2", levels["Max_Spawn_Limit_2"], "Effect_Value_Int"))
+    special_weight_bonus = float(get_upgrade_value(tables["restaurant_upg"], "Weight", levels["Weight"], "Effect_Value_Int"))
+    tip_bonus_multi = float(get_upgrade_value(tables["restaurant_upg"], "Bonus_Tips_Multi", levels["Bonus_Tips_Multi"], "Effect_Value_Float"))
+
+    allowed_ids = list(BASE_CUSTOMER_POOL)
+    for i in range(min(special_effect, len(SPECIAL_EXTRA_ORDER))):
+        allowed_ids.append(SPECIAL_EXTRA_ORDER[i])
+    for i in range(min(vip_effect, len(VIP_EXTRA_ORDER))):
+        allowed_ids.append(VIP_EXTRA_ORDER[i])
+    allowed_ids = set(allowed_ids)
+
+    pool: List[CustomerProfile] = []
+    for _, row in actions.iterrows():
+        cid = int(float(row["Customer_ID"]))
+        if cid not in allowed_ids:
+            continue
+        grade = str(row["Grade"])
+        weight = float(row.get("Weight") or 0.0)
+        if grade == "Special":
+            weight += special_weight_bonus
+        tip_info = tips_by_grade.get(grade, {"rate": 0.0, "multi": 0.0})
+        pool.append(
+            CustomerProfile(
+                customer_id=cid,
+                grade=grade,
+                weight=max(weight, 0.0001),
+                flow_velocity=float(row.get("Flow_Velocity") or 1.0),
+                first_order_time=float(row.get("First_Order_Time") or 0.0),
+                first_eat_time=float(row.get("First_Eat_Time") or 0.0),
+                second_order_rate=normalize_rate(row.get("Second_Order_Rate") or 0.0),
+                second_order_time=float(row.get("Second_Order_Time") or 0.0),
+                second_eat_time=float(row.get("Second_Eat_Time") or 0.0),
+                third_order_rate=normalize_rate(row.get("Third_Order_Rate") or 0.0),
+                third_order_time=float(row.get("Third_Order_Time") or 0.0),
+                third_eat_time=float(row.get("Third_Eat_Time") or 0.0),
+                tips_rate=tip_info["rate"],
+                tips_multi=tip_info["multi"] * tip_bonus_multi,
+            )
+        )
+    return pool
 
 
-# ---------- Simulation ----------
+def pick_customer(pool: List[CustomerProfile], rng: random.Random) -> CustomerProfile:
+    weights = [c.weight for c in pool]
+    return rng.choices(pool, weights=weights, k=1)[0]
 
-def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], day_length: int) -> SimResult:
+
+def pick_rarity_and_fish(rate_probs: np.ndarray, rarity_to_fish: Dict[str, List[str]], rng: random.Random):
+    rarity = rng.choices(RARITY_COLS, weights=rate_probs, k=1)[0]
+    fishes = rarity_to_fish.get(rarity, [])
+    if not fishes:
+        all_fishes = [f for arr in rarity_to_fish.values() for f in arr]
+        fish_id = rng.choice(all_fishes)
+        return rarity, fish_id
+    return rarity, rng.choice(fishes)
+
+
+def random_delay(fixed_df: pd.DataFrame, rng: random.Random) -> float:
+    row = to_numeric(fixed_df, ["DishWashTime", "MinSpawnDelay", "MaxSpawnDelay"]).iloc[0]
+    return rng.uniform(float(row["MinSpawnDelay"]), float(row["MaxSpawnDelay"]))
+
+
+def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], total_seconds: int, wait_after_full_seconds: int, seed: int) -> SimSummary:
+    rng = random.Random(seed)
+    levels = clamp_levels(levels)
+
     fishing_upg = tables["fishing_upg"]
-    rates = to_numeric(tables["rates"], ["Trash", "Normal", "Fine", "Superior", "Rare", "Elite", "Fantastic", "Legendary", "Sum"])
-    fish = tables["fish"]
-    recipes = tables["recipes"]
-    fixed = to_numeric(tables["fixed"], ["DishWashTime", "MinSpawnDelay", "MaxSpawnDelay"])
-    guest_actions = tables["guest_actions"]
-    guest_tips = tables["guest_tips"]
     restaurant_upg = tables["restaurant_upg"]
+    fixed_df = to_numeric(tables["fixed"], ["DishWashTime", "MinSpawnDelay", "MaxSpawnDelay"])
+    fixed_row = fixed_df.iloc[0]
 
-    bait_interval = get_upgrade_value(fishing_upg, "BaitMaking", levels.get("BaitMaking", 1), "Effect_Value_Int")
-    rod_count = get_upgrade_value(fishing_upg, "FishingRod", levels.get("FishingRod", 1), "Effect_Value_Int")
-    ship_multiplier = get_upgrade_value(fishing_upg, "Ship", levels.get("Ship", 1), "Effect_Value_Int")
-    if ship_multiplier <= 0:
-        ship_multiplier = 1.0
-    rate_id = get_rate_id_for_player_grade(fishing_upg, levels.get("PlayerGrade", 1))
-
-    catches_per_rod = day_length / max(bait_interval, 1)
-    catches_per_day = catches_per_rod * max(rod_count, 1) * ship_multiplier
-
-    base_fish_value = expected_fish_value_per_catch(fish, rates, rate_id)
-    dish_value_per_fish = recipe_value_per_fish(recipes, fish)
-    effective_fish_to_dish_value = max(base_fish_value, dish_value_per_fish)
-    dish_count = catches_per_day
-
-    seat_count = get_upgrade_value(restaurant_upg, "Max_Customer_Limit", levels.get("Max_Customer_Limit", 1), "Effect_Value_Int")
+    bait_seconds = int(get_upgrade_value(fishing_upg, "BaitMaking", levels["BaitMaking"], "Effect_Value_Int"))
+    rod_capacity = int(get_upgrade_value(fishing_upg, "FishingRod", levels["FishingRod"], "Effect_Value_Int"))
+    ship_capacity = int(get_upgrade_value(fishing_upg, "Ship", levels["Ship"], "Effect_Value_Int"))
+    seat_count = int(get_upgrade_value(restaurant_upg, "Max_Customer_Limit", levels["Max_Customer_Limit"], "Effect_Value_Int"))
     seat_count = max(seat_count, 1)
-    spawn_bonus_special = get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_1", levels.get("Max_Spawn_Limit_1", 1), "Effect_Value_Int")
-    spawn_bonus_vip = get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_2", levels.get("Max_Spawn_Limit_2", 1), "Effect_Value_Int")
-    spawn_weight_bonus = get_upgrade_value(restaurant_upg, "Weight", levels.get("Weight", 1), "Effect_Value_Int")
-    dish_price_bonus = (
-        get_upgrade_value(restaurant_upg, "Bonus_Dish_Price_1", levels.get("Bonus_Dish_Price_1", 1), "Effect_Value_Int")
-        + get_upgrade_value(restaurant_upg, "Bonus_Dish_Price_2", levels.get("Bonus_Dish_Price_2", 1), "Effect_Value_Int")
-    )
-    tip_bonus = get_upgrade_value(restaurant_upg, "Bonus_Tips_Multi", levels.get("Bonus_Tips_Multi", 1), "Effect_Value_Int")
 
-    guest_stats = weighted_guest_stats(guest_actions)
-    tip_multiplier = weighted_tip_multiplier(guest_actions, guest_tips)
+    active_rate_id = get_rate_id_for_player_grade(fishing_upg, levels["PlayerGrade"])
+    rate_map, rarity_to_fish, fish_rarity = build_fishing_maps(tables)
+    if active_rate_id not in rate_map:
+        raise KeyError(f"Fishing_Rate_Data에 {active_rate_id}가 없습니다.")
+    fish_to_recipe, recipe_price, recipe_yield = build_recipe_maps(tables["recipes"], levels, restaurant_upg)
+    customer_pool = build_customer_pool(tables, levels)
 
-    dish_wash_time = float(fixed.iloc[0]["DishWashTime"])
-    min_spawn = float(fixed.iloc[0]["MinSpawnDelay"])
-    max_spawn = float(fixed.iloc[0]["MaxSpawnDelay"])
-    avg_spawn_gap = (min_spawn + max_spawn) / 2.0
-    spawn_per_day = day_length / max(avg_spawn_gap, 1)
-    spawn_per_day *= 1.0 + (spawn_bonus_special + spawn_bonus_vip + spawn_weight_bonus) * 0.05
+    tickets = rod_capacity
+    fish_inventory: Dict[str, int] = {}
+    dish_inventory: Dict[str, int] = {}
+    rarity_counter: Dict[str, int] = {r: 0 for r in RARITY_COLS}
+    fish_counter: Dict[str, int] = {}
+    recipe_counter: Dict[str, int] = {}
 
-    avg_customer_cycle = guest_stats["expected_cycle"] + dish_wash_time
-    seat_capacity_per_day = seat_count * day_length / max(avg_customer_cycle, 1)
-    customer_capacity = min(spawn_per_day, seat_capacity_per_day)
+    fish_caught = 0
+    fishing_sessions = 0
+    tickets_spent = 0
+    dishes_cooked = 0
+    dishes_sold = 0
+    gross_sales = 0.0
+    tips_sales = 0.0
+    customers_spawned = 0
+    customers_completed = 0
+    special_spawned = 0
+    vip_spawned = 0
+    restaurant_idle_seconds = 0
+    peak_fish_inventory = 0
+    peak_dish_stock = 0
 
-    expected_orders = guest_stats["expected_orders"]
-    sales_capacity = customer_capacity * expected_orders
-    realized_sales = min(dish_count, sales_capacity)
+    seats = [SeatState() for _ in range(seat_count)]
 
-    avg_sale_price = effective_fish_to_dish_value + dish_price_bonus
-    gross_sales = realized_sales * avg_sale_price
-    tips = gross_sales * (tip_multiplier + tip_bonus / 100.0)
-    total_revenue = gross_sales + tips
+    next_charge_at = bait_seconds
+    next_visit_at = None
+    if tickets >= rod_capacity:
+        next_visit_at = wait_after_full_seconds
 
-    if dish_count < sales_capacity:
+    def total_fish_inventory() -> int:
+        return sum(fish_inventory.values())
+
+    def total_dish_inventory() -> int:
+        return sum(dish_inventory.values())
+
+    def can_spawn_customer() -> bool:
+        return total_dish_inventory() > 0
+
+    def convert_all_fish_to_dishes() -> None:
+        nonlocal dishes_cooked, peak_dish_stock
+        to_delete = []
+        for fish_id, count in list(fish_inventory.items()):
+            recipe_id = fish_to_recipe.get(fish_id)
+            if not recipe_id:
+                continue
+            produced = count * recipe_yield[recipe_id]
+            if produced > 0:
+                dish_inventory[recipe_id] = dish_inventory.get(recipe_id, 0) + produced
+                dishes_cooked += produced
+            to_delete.append(fish_id)
+        for fish_id in to_delete:
+            fish_inventory.pop(fish_id, None)
+        peak_dish_stock = max(peak_dish_stock, total_dish_inventory())
+
+    def consume_random_dish() -> Optional[str]:
+        available = [rid for rid, cnt in dish_inventory.items() if cnt > 0]
+        if not available:
+            return None
+        rid = rng.choice(available)
+        dish_inventory[rid] -= 1
+        if dish_inventory[rid] <= 0:
+            del dish_inventory[rid]
+        return rid
+
+    def start_customer_for_seat(seat: SeatState) -> None:
+        nonlocal customers_spawned, special_spawned, vip_spawned
+        customer = pick_customer(customer_pool, rng)
+        seat.customer = customer
+        seat.orders_completed = 0
+        seat.phase = "walking_to_seat"
+        seat.timer = HALF_TRIP_AT_V1 / max(customer.flow_velocity, 0.0001)
+        customers_spawned += 1
+        if customer.grade == "Special":
+            special_spawned += 1
+        elif customer.grade == "VIP":
+            vip_spawned += 1
+
+    def begin_order(seat: SeatState, order_num: int) -> None:
+        recipe_id = consume_random_dish()
+        if recipe_id is None:
+            seat.phase = "walking_to_despawn"
+            seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+            return
+        seat.orders_completed = order_num
+        seat.phase = f"waiting_order_{order_num}"
+        if order_num == 1:
+            seat.timer = seat.customer.first_order_time
+        elif order_num == 2:
+            seat.timer = seat.customer.second_order_time
+        else:
+            seat.timer = seat.customer.third_order_time
+        seat.current_recipe_id = recipe_id
+
+    for t in range(1, total_seconds + 1):
+        # fishing ticket charge
+        if bait_seconds > 0 and t >= next_charge_at:
+            while t >= next_charge_at:
+                if tickets < rod_capacity:
+                    tickets += 1
+                    if tickets >= rod_capacity and next_visit_at is None:
+                        next_visit_at = t + wait_after_full_seconds
+                next_charge_at += bait_seconds
+
+        # visit to fishing/restaurant scene after full charge wait
+        if next_visit_at is not None and t >= next_visit_at:
+            fishing_sessions += 1
+            available_space = max(ship_capacity - total_fish_inventory(), 0)
+            casts = min(tickets, available_space)
+            rate_probs = rate_map[active_rate_id]
+            for _ in range(casts):
+                rarity, fish_id = pick_rarity_and_fish(rate_probs, rarity_to_fish, rng)
+                fish_inventory[fish_id] = fish_inventory.get(fish_id, 0) + 1
+                fish_counter[fish_id] = fish_counter.get(fish_id, 0) + 1
+                rarity_counter[rarity] = rarity_counter.get(rarity, 0) + 1
+                fish_caught += 1
+            tickets -= casts
+            tickets_spent += casts
+            peak_fish_inventory = max(peak_fish_inventory, total_fish_inventory())
+            convert_all_fish_to_dishes()
+            next_visit_at = None
+            if tickets >= rod_capacity:
+                next_visit_at = t + wait_after_full_seconds
+
+        # restaurant seat simulation
+        if total_dish_inventory() <= 0:
+            restaurant_idle_seconds += 1
+
+        for seat in seats:
+            if seat.timer > 0:
+                seat.timer = max(0.0, seat.timer - 1.0)
+                if seat.timer > 0:
+                    continue
+
+            if seat.phase == "ready_for_spawn":
+                if can_spawn_customer():
+                    start_customer_for_seat(seat)
+            elif seat.phase == "walking_to_seat":
+                begin_order(seat, 1)
+            elif seat.phase == "waiting_order_1":
+                seat.phase = "eating_1"
+                seat.timer = seat.customer.first_eat_time
+            elif seat.phase == "eating_1":
+                price = recipe_price.get(seat.current_recipe_id, 0.0)
+                gross_sales += price
+                if rng.random() < seat.customer.tips_rate:
+                    tips_sales += price * seat.customer.tips_multi
+                dishes_sold += 1
+                if total_dish_inventory() > 0 and rng.random() < seat.customer.second_order_rate:
+                    begin_order(seat, 2)
+                else:
+                    seat.phase = "walking_to_despawn"
+                    seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+            elif seat.phase == "waiting_order_2":
+                seat.phase = "eating_2"
+                seat.timer = seat.customer.second_eat_time
+            elif seat.phase == "eating_2":
+                price = recipe_price.get(seat.current_recipe_id, 0.0)
+                gross_sales += price
+                if rng.random() < seat.customer.tips_rate:
+                    tips_sales += price * seat.customer.tips_multi
+                dishes_sold += 1
+                if total_dish_inventory() > 0 and rng.random() < seat.customer.third_order_rate:
+                    begin_order(seat, 3)
+                else:
+                    seat.phase = "walking_to_despawn"
+                    seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+            elif seat.phase == "waiting_order_3":
+                seat.phase = "eating_3"
+                seat.timer = seat.customer.third_eat_time
+            elif seat.phase == "eating_3":
+                price = recipe_price.get(seat.current_recipe_id, 0.0)
+                gross_sales += price
+                if rng.random() < seat.customer.tips_rate:
+                    tips_sales += price * seat.customer.tips_multi
+                dishes_sold += 1
+                seat.phase = "walking_to_despawn"
+                seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+            elif seat.phase == "walking_to_despawn":
+                customers_completed += 1
+                seat.phase = "dishwashing"
+                seat.timer = float(fixed_row["DishWashTime"])
+                seat.customer = None
+                seat.current_recipe_id = None
+            elif seat.phase == "dishwashing":
+                seat.phase = "spawn_delay"
+                seat.timer = random_delay(tables["fixed"], rng)
+            elif seat.phase == "spawn_delay":
+                seat.phase = "ready_for_spawn"
+
+        peak_dish_stock = max(peak_dish_stock, total_dish_inventory())
+
+    remaining_tickets = tickets
+    remaining_dishes = total_dish_inventory()
+    fish_left_in_inventory = total_fish_inventory()
+    total_sales = gross_sales + tips_sales
+
+    if dishes_sold == 0 and fish_caught == 0:
+        bottleneck = "낚시 방문 주기/인벤토리 병목"
+    elif remaining_dishes == 0 and fish_caught > 0:
         bottleneck = "낚시 공급 부족"
-    elif sales_capacity < spawn_per_day:
+    elif restaurant_idle_seconds < total_seconds * 0.1:
         bottleneck = "좌석/체류시간 병목"
     else:
         bottleneck = "손님 유입 병목"
 
-    return SimResult(
-        catches_per_day=catches_per_day,
-        fish_value_per_catch=base_fish_value,
-        total_fish_value=catches_per_day * base_fish_value,
-        dish_count=dish_count,
-        sales_capacity=sales_capacity,
-        realized_sales=realized_sales,
+    rarity_df = pd.DataFrame({"Rarity": list(rarity_counter.keys()), "Count": list(rarity_counter.values())})
+    fish_df = pd.DataFrame(sorted(fish_counter.items(), key=lambda x: (-x[1], x[0])), columns=["Fish_ID", "Count"])
+
+    recipe_counter = {}
+    for fish_id, count in fish_counter.items():
+        recipe_id = fish_to_recipe.get(fish_id)
+        if recipe_id:
+            recipe_counter[recipe_id] = recipe_counter.get(recipe_id, 0) + count * recipe_yield[recipe_id]
+    recipe_df = pd.DataFrame(sorted(recipe_counter.items(), key=lambda x: (-x[1], x[0])), columns=["Recipe_ID", "Cooked_Count"])
+
+    return SimSummary(
+        fish_caught=fish_caught,
+        fishing_sessions=fishing_sessions,
+        tickets_spent=tickets_spent,
+        fish_left_in_inventory=fish_left_in_inventory,
+        dishes_cooked=dishes_cooked,
+        dishes_sold=dishes_sold,
         gross_sales=gross_sales,
-        tips=tips,
-        total_revenue=total_revenue,
+        tips_sales=tips_sales,
+        total_sales=total_sales,
+        customers_spawned=customers_spawned,
+        customers_completed=customers_completed,
+        special_spawned=special_spawned,
+        vip_spawned=vip_spawned,
+        peak_fish_inventory=peak_fish_inventory,
+        peak_dish_stock=peak_dish_stock,
+        remaining_tickets=remaining_tickets,
+        remaining_dishes=remaining_dishes,
+        restaurant_idle_seconds=restaurant_idle_seconds,
         bottleneck=bottleneck,
-        spawn_per_day=spawn_per_day,
-        avg_customer_cycle=avg_customer_cycle,
-        seat_capacity_per_day=seat_capacity_per_day,
+        active_rate_id=active_rate_id,
+        rarity_breakdown=rarity_df,
+        fish_breakdown=fish_df,
+        recipe_breakdown=recipe_df,
     )
 
 
-# ---------- UI ----------
+# ---------------- UI ----------------
 
 def main() -> None:
     st.set_page_config(page_title="Balance Simulator", layout="wide")
-    st.title("밸런스 시뮬레이터 v0")
-    st.caption("업로드한 XLSX/ODS 데이터 테이블을 읽어서 기대값 기반으로 낚시-식당 루프를 확인하는 Streamlit 프로토타입")
+    st.title("밸런스 시뮬레이터")
+    st.caption("낚시 풀충전 대기 → 방문 시 전부 낚기 → 전부 요리 → 좌석별 손님 소비를 반영한 프로토타입")
 
     with st.sidebar:
-        st.header("데이터 경로")
         base_dir = st.text_input("데이터 파일 폴더", value=str(Path(__file__).resolve().parent))
-        day_length = st.slider("시뮬레이션 길이(초)", min_value=1800, max_value=SECONDS_PER_DAY, value=SECONDS_PER_DAY, step=1800)
+        total_seconds = st.slider("시뮬레이션 시간(초)", 600, SECONDS_PER_DAY * 7, SECONDS_PER_DAY, 600)
+        wait_after_full_seconds = st.slider("풀충전 후 대기시간(초)", 0, SECONDS_PER_DAY, 0, 60)
+        seed = st.number_input("랜덤 시드", min_value=0, value=42, step=1)
 
     try:
         tables = load_all_data(base_dir)
@@ -336,100 +620,83 @@ def main() -> None:
         st.error(f"데이터 로드 실패: {e}")
         st.stop()
 
-    st.success("3개 데이터 테이블 로드 완료")
+    fish_ranges = get_upgrade_ranges(tables["fishing_upg"], tables["fishing_settings"])
+    rest_ranges = get_upgrade_ranges(tables["restaurant_upg"], tables["restaurant_settings"])
 
-    fish_upgrade_ranges = build_upgrade_level_lookup(tables["fishing_upg"], tables["fishing_settings"])
-    restaurant_upgrade_ranges = build_upgrade_level_lookup(tables["restaurant_upg"], tables["restaurant_settings"])
-
-    st.subheader("업그레이드 레벨 설정")
     col1, col2 = st.columns(2)
-
     levels: Dict[str, int] = {}
     with col1:
-        st.markdown("**Fishing**")
-        for key, (min_lv, max_lv) in fish_upgrade_ranges.items():
-            if key in {"분류", "Enum"}:
-                continue
-            levels[key] = st.slider(key, min_value=min_lv, max_value=max_lv, value=min_lv, key=f"fish_{key}")
+        st.subheader("Fishing")
+        for key in ["PlayerGrade", "BaitMaking", "FishingRod", "Ship"]:
+            if key in fish_ranges:
+                lo, hi = fish_ranges[key]
+                levels[key] = st.slider(key, lo, hi, lo)
     with col2:
-        st.markdown("**Restaurant**")
-        for key, (min_lv, max_lv) in restaurant_upgrade_ranges.items():
-            if key in {"분류", "Enum", "Unlock_Gramophone", "Unlock_Cat_Object"}:
-                continue
-            levels[key] = st.slider(key, min_value=min_lv, max_value=max_lv, value=min_lv, key=f"rest_{key}")
+        st.subheader("Restaurant")
+        for key in [
+            "Master_Lv", "Max_Customer_Limit", "Max_Spawn_Limit_1", "Max_Spawn_Limit_2", "Weight",
+            "Bonus_Tips_Multi", "Bonus_Dish_Price_1", "Bonus_Dish_Price_2", "Bonus_Food_1", "Bonus_Food_2",
+        ]:
+            if key in rest_ranges:
+                lo, hi = rest_ranges[key]
+                levels[key] = st.slider(key, lo, hi, lo)
 
-    result = run_simulation(tables, levels, day_length)
+    levels = clamp_levels(levels)
+    result = run_simulation(tables, levels, total_seconds, wait_after_full_seconds, int(seed))
 
-    st.subheader("핵심 결과")
-    k1, k2, k3, k4 = st.columns(4)
-    k1.metric("일일 총수익", f"{result.total_revenue:,.0f}")
-    k2.metric("총 판매량", f"{result.realized_sales:,.1f}")
-    k3.metric("낚시 횟수", f"{result.catches_per_day:,.1f}")
-    k4.metric("병목", result.bottleneck)
+    st.info(f"현재 PlayerGrade {levels['PlayerGrade']} → 참조 Rate_ID: **{result.active_rate_id}**")
 
-    st.subheader("세부 지표")
-    detail_df = pd.DataFrame(
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("총수익", f"{result.total_sales:,.0f}")
+    m2.metric("총 판매량", f"{result.dishes_sold:,}")
+    m3.metric("낚은 물고기", f"{result.fish_caught:,}")
+    m4.metric("병목", result.bottleneck)
+
+    summary_df = pd.DataFrame(
         {
             "Metric": [
-                "Expected fish value / catch",
-                "Total raw fish value",
-                "Dish count available",
-                "Sales capacity",
-                "Spawn attempts / day",
-                "Seat capacity / day",
-                "Avg customer cycle (sec)",
-                "Gross sales",
-                "Tips",
-                "Total revenue",
+                "Active Rate_ID", "Fishing Sessions", "Tickets Spent", "Remaining Tickets", "Fish Left Inventory",
+                "Dishes Cooked", "Dishes Sold", "Remaining Dishes", "Gross Sales", "Tips Sales", "Total Sales",
+                "Customers Spawned", "Customers Completed", "Special Spawned", "VIP Spawned",
+                "Peak Fish Inventory", "Peak Dish Stock", "Restaurant Idle Seconds",
             ],
             "Value": [
-                result.fish_value_per_catch,
-                result.total_fish_value,
-                result.dish_count,
-                result.sales_capacity,
-                result.spawn_per_day,
-                result.seat_capacity_per_day,
-                result.avg_customer_cycle,
-                result.gross_sales,
-                result.tips,
-                result.total_revenue,
+                result.active_rate_id, result.fishing_sessions, result.tickets_spent, result.remaining_tickets,
+                result.fish_left_in_inventory, result.dishes_cooked, result.dishes_sold, result.remaining_dishes,
+                round(result.gross_sales, 2), round(result.tips_sales, 2), round(result.total_sales, 2),
+                result.customers_spawned, result.customers_completed, result.special_spawned, result.vip_spawned,
+                result.peak_fish_inventory, result.peak_dish_stock, result.restaurant_idle_seconds,
             ],
         }
     )
-    st.dataframe(detail_df, use_container_width=True)
+    st.dataframe(summary_df, use_container_width=True)
 
-    st.subheader("병목 비교")
-    compare_df = pd.DataFrame(
-        {
-            "Flow": ["Fishing supply", "Restaurant sales capacity"],
-            "Value": [result.dish_count, result.sales_capacity],
-        }
-    )
-    st.bar_chart(compare_df.set_index("Flow"))
-
-    with st.expander("현재 모델 가정 보기"):
-        st.markdown(
-            """
-- 현재 버전은 **기대값 기반 시뮬레이터**입니다. 즉, 손님/낚시 결과를 난수로 한 명씩 굴리지 않고 평균값으로 계산합니다.
-- `Ship` 업그레이드는 현재 간단히 **낚시 횟수 배수**로 반영했습니다. 실제 의미가 다르면 수식만 교체하면 됩니다.
-- 레시피는 `생선 1개 → 요리 Yield개 생산`으로 보고, 평균적인 요리 총매출 값을 계산합니다.
-- 손님 로직은 `주문 시간 + 식사 시간 + 재주문 확률`의 기대값으로 좌석 점유 시간을 계산합니다.
-- `Max_Spawn_Limit`, `Weight` 계열은 아직 실제 게임 수식이 없어서 **유입 보정치**로 단순 반영했습니다.
-            """
-        )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.subheader("등급별 어획")
+        st.dataframe(result.rarity_breakdown, use_container_width=True)
+    with c2:
+        st.subheader("물고기별 어획")
+        st.dataframe(result.fish_breakdown, use_container_width=True)
+    with c3:
+        st.subheader("레시피 생산량")
+        st.dataframe(result.recipe_breakdown, use_container_width=True)
 
     with st.expander("원본 데이터 미리보기"):
-        tab1, tab2, tab3 = st.tabs(["Fishing", "Restaurant", "Guest"])
-        with tab1:
+        tabs = st.tabs(["Fishing_UPG", "Rates", "Fish", "Restaurant_UPG", "Recipes", "Guest_Actions", "Guest_Tips"])
+        with tabs[0]:
             st.dataframe(tables["fishing_upg"], use_container_width=True)
+        with tabs[1]:
             st.dataframe(tables["rates"], use_container_width=True)
+        with tabs[2]:
             st.dataframe(tables["fish"], use_container_width=True)
-        with tab2:
+        with tabs[3]:
             st.dataframe(tables["restaurant_upg"], use_container_width=True)
+        with tabs[4]:
             st.dataframe(tables["recipes"], use_container_width=True)
-        with tab3:
-            st.dataframe(tables["fixed"], use_container_width=True)
+        with tabs[5]:
             st.dataframe(tables["guest_actions"], use_container_width=True)
+        with tabs[6]:
             st.dataframe(tables["guest_tips"], use_container_width=True)
 
 
