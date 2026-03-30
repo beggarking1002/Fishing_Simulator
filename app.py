@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Dict, List, Optional
 import random
+import re
 
 import numpy as np
 import pandas as pd
@@ -12,11 +12,6 @@ import streamlit as st
 SECONDS_PER_DAY = 24 * 60 * 60
 HALF_TRIP_AT_V1 = 17.61 / 2.0
 RARITY_COLS = ["Trash", "Normal", "Fine", "Superior", "Rare", "Elite", "Fantastic", "Legendary"]
-DATA_FILE_STEMS = {
-    "restaurant": "Restaurant_Data",
-    "fishing": "Fishing_Data",
-    "guest": "Guest_Data",
-}
 BASE_CUSTOMER_POOL = list(range(1, 15)) + [18, 19]
 SPECIAL_EXTRA_ORDER = [15, 16, 17]
 VIP_EXTRA_ORDER = [20]
@@ -46,6 +41,8 @@ class SeatState:
         self.timer = 0.0
         self.customer: Optional[CustomerProfile] = None
         self.orders_completed = 0
+        self.has_eaten = False # 식사 여부 (유령 설거지 방지용)
+        self.current_recipe_id: Optional[str] = None
 
 
 @dataclass
@@ -68,6 +65,7 @@ class SimSummary:
     remaining_tickets: int
     remaining_dishes: int
     restaurant_idle_seconds: int
+    out_of_stock_seconds: int
     bottleneck: str
     active_rate_id: str
     rarity_breakdown: pd.DataFrame
@@ -76,19 +74,6 @@ class SimSummary:
 
 
 # ---------------- data loading ----------------
-
-def read_table(file_path: Path, sheet_name: str) -> pd.DataFrame:
-    suffix = file_path.suffix.lower()
-    engine = "odf" if suffix == ".ods" else None
-    return pd.read_excel(file_path, sheet_name=sheet_name, engine=engine, header=None)
-
-
-def find_data_file(base: Path, stem: str) -> Path:
-    candidates = sorted(base.glob(f"{stem}*.xlsx")) + sorted(base.glob(f"{stem}*.xls")) + sorted(base.glob(f"{stem}*.ods"))
-    if not candidates:
-        raise FileNotFoundError(f"{stem}로 시작하는 데이터 파일을 찾지 못했습니다: {base}")
-    return candidates[0]
-
 
 def clean_table(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -120,23 +105,26 @@ def clean_table(df: pd.DataFrame) -> pd.DataFrame:
 
 
 @st.cache_data
-def load_all_data(base_dir: str) -> Dict[str, pd.DataFrame]:
-    base = Path(base_dir)
-    restaurant_file = find_data_file(base, DATA_FILE_STEMS["restaurant"])
-    fishing_file = find_data_file(base, DATA_FILE_STEMS["fishing"])
-    guest_file = find_data_file(base, DATA_FILE_STEMS["guest"])
+def load_all_data(fishing_id: str, restaurant_id: str, guest_id: str) -> Dict[str, pd.DataFrame]:
+    fishing_url = f"https://docs.google.com/spreadsheets/d/{fishing_id}/export?format=xlsx"
+    restaurant_url = f"https://docs.google.com/spreadsheets/d/{restaurant_id}/export?format=xlsx"
+    guest_url = f"https://docs.google.com/spreadsheets/d/{guest_id}/export?format=xlsx"
+
+    fishing_sheets = pd.read_excel(fishing_url, sheet_name=None, header=None)
+    restaurant_sheets = pd.read_excel(restaurant_url, sheet_name=None, header=None)
+    guest_sheets = pd.read_excel(guest_url, sheet_name=None, header=None)
 
     return {
-        "restaurant_upg": clean_table(read_table(restaurant_file, "Restaurant_UPG_Data")),
-        "restaurant_settings": clean_table(read_table(restaurant_file, "Restaurant_UPG_Setting")),
-        "recipes": clean_table(read_table(restaurant_file, "Recipe_Data")),
-        "fishing_upg": clean_table(read_table(fishing_file, "Fishing_UPG_Data")),
-        "fishing_settings": clean_table(read_table(fishing_file, "Fishing_UPG_Setting")),
-        "rates": clean_table(read_table(fishing_file, "Fishing_Rate_Data")),
-        "fish": clean_table(read_table(fishing_file, "Fish_Data")),
-        "fixed": clean_table(read_table(guest_file, "Fixed_Value")),
-        "guest_actions": clean_table(read_table(guest_file, "Customer_Action")),
-        "guest_tips": clean_table(read_table(guest_file, "Customer_Tips")),
+        "restaurant_upg": clean_table(restaurant_sheets["Restaurant_UPG_Data"]),
+        "restaurant_settings": clean_table(restaurant_sheets["Restaurant_UPG_Setting"]),
+        "recipes": clean_table(restaurant_sheets["Recipe_Data"]),
+        "fishing_upg": clean_table(fishing_sheets["Fishing_UPG_Data"]),
+        "fishing_settings": clean_table(fishing_sheets["Fishing_UPG_Setting"]),
+        "rates": clean_table(fishing_sheets["Fishing_Rate_Data"]),
+        "fish": clean_table(fishing_sheets["Fish_Data"]),
+        "fixed": clean_table(guest_sheets["Fixed_Value"]),
+        "guest_actions": clean_table(guest_sheets["Customer_Action"]),
+        "guest_tips": clean_table(guest_sheets["Customer_Tips"]),
     }
 
 
@@ -378,8 +366,10 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     special_spawned = 0
     vip_spawned = 0
     restaurant_idle_seconds = 0
+    out_of_stock_seconds = 0
     peak_fish_inventory = 0
     peak_dish_stock = 0
+    reserved_dishes = 0
 
     seats = [SeatState() for _ in range(seat_count)]
 
@@ -395,7 +385,8 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         return sum(dish_inventory.values())
 
     def can_spawn_customer() -> bool:
-        return total_dish_inventory() > 0
+        # 💡 FIX 1: 유령 손님 방지 (재고에서 이미 예약된 분량을 빼고 계산)
+        return (total_dish_inventory() - reserved_dishes) > 0
 
     def convert_all_fish_to_dishes() -> None:
         nonlocal dishes_cooked, peak_dish_stock
@@ -424,12 +415,16 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         return rid
 
     def start_customer_for_seat(seat: SeatState) -> None:
-        nonlocal customers_spawned, special_spawned, vip_spawned
+        nonlocal customers_spawned, special_spawned, vip_spawned, reserved_dishes
+        reserved_dishes += 1  # 💡 손님이 스폰될 때 미리 재고 하나를 찜함
+        
         customer = pick_customer(customer_pool, rng)
         seat.customer = customer
         seat.orders_completed = 0
+        seat.has_eaten = False # 식사 상태 초기화
         seat.phase = "walking_to_seat"
         seat.timer = HALF_TRIP_AT_V1 / max(customer.flow_velocity, 0.0001)
+        
         customers_spawned += 1
         if customer.grade == "Special":
             special_spawned += 1
@@ -437,23 +432,36 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
             vip_spawned += 1
 
     def begin_order(seat: SeatState, order_num: int) -> None:
+        nonlocal reserved_dishes
+        
+        # 💡 첫 번째 주문일 경우 스폰될 때 찜해둔 예약을 해제 (실제 차감 시도)
+        if order_num == 1:
+            reserved_dishes -= 1
+            
         recipe_id = consume_random_dish()
+        
+        # 음식이 없으면 화내면서 바로 퇴장
         if recipe_id is None:
             seat.phase = "walking_to_despawn"
             seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
             return
+            
+        # 음식을 받았으므로 식사 상태 True
+        seat.has_eaten = True
         seat.orders_completed = order_num
         seat.phase = f"waiting_order_{order_num}"
+        
         if order_num == 1:
             seat.timer = seat.customer.first_order_time
         elif order_num == 2:
             seat.timer = seat.customer.second_order_time
         else:
             seat.timer = seat.customer.third_order_time
+            
         seat.current_recipe_id = recipe_id
 
     for t in range(1, total_seconds + 1):
-        # fishing ticket charge
+        # 낚시 티켓 충전
         if bait_seconds > 0 and t >= next_charge_at:
             while t >= next_charge_at:
                 if tickets < rod_capacity:
@@ -462,7 +470,7 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
                         next_visit_at = t + wait_after_full_seconds
                 next_charge_at += bait_seconds
 
-        # visit to fishing/restaurant scene after full charge wait
+        # 낚시터 방문
         if next_visit_at is not None and t >= next_visit_at:
             fishing_sessions += 1
             available_space = max(ship_capacity - total_fish_inventory(), 0)
@@ -482,8 +490,11 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
             if tickets >= rod_capacity:
                 next_visit_at = t + wait_after_full_seconds
 
-        # restaurant seat simulation
+        # 💡 FIX 3: 매장 유휴 시간과 재고 고갈 시간 분리
         if total_dish_inventory() <= 0:
+            out_of_stock_seconds += 1
+            
+        if all(s.customer is None for s in seats):
             restaurant_idle_seconds += 1
 
         for seat in seats:
@@ -537,9 +548,15 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
                 seat.phase = "walking_to_despawn"
                 seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
             elif seat.phase == "walking_to_despawn":
-                customers_completed += 1
-                seat.phase = "dishwashing"
-                seat.timer = float(fixed_row["DishWashTime"])
+                # 💡 FIX 2: 요리를 하나라도 먹은 손님만 완료 처리 및 설거지 진행
+                if seat.has_eaten:
+                    customers_completed += 1
+                    seat.phase = "dishwashing"
+                    seat.timer = float(fixed_row["DishWashTime"])
+                else:
+                    seat.phase = "spawn_delay"
+                    seat.timer = random_delay(tables["fixed"], rng)
+                
                 seat.customer = None
                 seat.current_recipe_id = None
             elif seat.phase == "dishwashing":
@@ -555,14 +572,15 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     fish_left_in_inventory = total_fish_inventory()
     total_sales = gross_sales + tips_sales
 
+    # 💡 FIX 3 연장선: 고도화된 병목 판정 조건 적용
     if dishes_sold == 0 and fish_caught == 0:
         bottleneck = "낚시 방문 주기/인벤토리 병목"
-    elif remaining_dishes == 0 and fish_caught > 0:
-        bottleneck = "낚시 공급 부족"
+    elif out_of_stock_seconds > total_seconds * 0.1 and remaining_dishes == 0:
+        bottleneck = "낚시 공급 부족 (재고 고갈)"
     elif restaurant_idle_seconds < total_seconds * 0.1:
-        bottleneck = "좌석/체류시간 병목"
+        bottleneck = "좌석/체류시간 병목 (회전율 한계)"
     else:
-        bottleneck = "손님 유입 병목"
+        bottleneck = "손님 유입 병목 (마케팅/스폰 부족)"
 
     rarity_df = pd.DataFrame({"Rarity": list(rarity_counter.keys()), "Count": list(rarity_counter.values())})
     fish_df = pd.DataFrame(sorted(fish_counter.items(), key=lambda x: (-x[1], x[0])), columns=["Fish_ID", "Count"])
@@ -593,6 +611,7 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         remaining_tickets=remaining_tickets,
         remaining_dishes=remaining_dishes,
         restaurant_idle_seconds=restaurant_idle_seconds,
+        out_of_stock_seconds=out_of_stock_seconds,
         bottleneck=bottleneck,
         active_rate_id=active_rate_id,
         rarity_breakdown=rarity_df,
@@ -603,21 +622,37 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
 
 # ---------------- UI ----------------
 
+def extract_id(url: str) -> str:
+    match = re.search(r"/d/([a-zA-Z0-9-_]+)", url)
+    return match.group(1) if match else ""
+
+
 def main() -> None:
     st.set_page_config(page_title="Balance Simulator", layout="wide")
     st.title("밸런스 시뮬레이터")
     st.caption("낚시 풀충전 대기 → 방문 시 전부 낚기 → 전부 요리 → 좌석별 손님 소비를 반영한 프로토타입")
 
     with st.sidebar:
-        base_dir = st.text_input("데이터 파일 폴더", value=str(Path(__file__).resolve().parent))
+        st.subheader("Google Sheets Links")
+        fishing_link = st.text_input("Fishing Data URL", value="https://docs.google.com/spreadsheets/d/1hRIRi-KPGhrhNpjivmk3fK_2HeK9YeP1eK5ygCh837w/edit?usp=drive_link")
+        restaurant_link = st.text_input("Restaurant Data URL", value="https://docs.google.com/spreadsheets/d/1iJgw7DdrnDBxqxrpiy8QH0hCfX3CR_MbIl6RgIpvS7s/edit?usp=drive_link")
+        guest_link = st.text_input("Customer Data URL", value="https://docs.google.com/spreadsheets/d/1YO5eyJvc26dD0JXTYaJRWGz3gd9cQnqkOjO23i0SKVc/edit?usp=drive_link")
+
+        st.divider()
         total_seconds = st.slider("시뮬레이션 시간(초)", 600, SECONDS_PER_DAY * 7, SECONDS_PER_DAY, 600)
         wait_after_full_seconds = st.slider("풀충전 후 대기시간(초)", 0, SECONDS_PER_DAY, 0, 60)
         seed = st.number_input("랜덤 시드", min_value=0, value=42, step=1)
 
+    fishing_id = extract_id(fishing_link)
+    restaurant_id = extract_id(restaurant_link)
+    guest_id = extract_id(guest_link)
+
     try:
-        tables = load_all_data(base_dir)
+        with st.spinner("구글 시트에서 데이터를 불러오는 중..."):
+            tables = load_all_data(fishing_id, restaurant_id, guest_id)
     except Exception as e:
         st.error(f"데이터 로드 실패: {e}")
+        st.warning("팁: 구글 시트의 공유 권한이 '링크가 있는 모든 사용자(뷰어)'로 설정되어 있는지 확인해주세요.")
         st.stop()
 
     fish_ranges = get_upgrade_ranges(tables["fishing_upg"], tables["fishing_settings"])
@@ -658,14 +693,14 @@ def main() -> None:
                 "Active Rate_ID", "Fishing Sessions", "Tickets Spent", "Remaining Tickets", "Fish Left Inventory",
                 "Dishes Cooked", "Dishes Sold", "Remaining Dishes", "Gross Sales", "Tips Sales", "Total Sales",
                 "Customers Spawned", "Customers Completed", "Special Spawned", "VIP Spawned",
-                "Peak Fish Inventory", "Peak Dish Stock", "Restaurant Idle Seconds",
+                "Peak Fish Inventory", "Peak Dish Stock", "Out of Stock Seconds", "Restaurant Idle Seconds",
             ],
             "Value": [
                 result.active_rate_id, result.fishing_sessions, result.tickets_spent, result.remaining_tickets,
                 result.fish_left_in_inventory, result.dishes_cooked, result.dishes_sold, result.remaining_dishes,
                 round(result.gross_sales, 2), round(result.tips_sales, 2), round(result.total_sales, 2),
                 result.customers_spawned, result.customers_completed, result.special_spawned, result.vip_spawned,
-                result.peak_fish_inventory, result.peak_dish_stock, result.restaurant_idle_seconds,
+                result.peak_fish_inventory, result.peak_dish_stock, result.out_of_stock_seconds, result.restaurant_idle_seconds,
             ],
         }
     )
