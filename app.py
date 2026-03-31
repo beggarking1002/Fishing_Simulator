@@ -75,20 +75,31 @@ class SimSummary:
 
 def clean_table(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out.columns = [str(c).strip() for c in out.iloc[0].tolist()]
-    out = out.iloc[1:].reset_index(drop=True)
+    out = out.dropna(how="all").reset_index(drop=True)
+
+    header_idx = 0
+    # Menu_UPG_Data 처럼 Upgrade_Type 없이 Level, Cost, Effect_Value_Int만 있는 경우를 대비해 키워드 추가
+    keywords = ["Upgrade_Type", "Fish_ID", "Recipe_ID", "Customer_ID", "Gacha_Group_ID", "DishWashTime", "Upgrade", "Type", "Effect_Value_Int", "Level", "Cost"]
+    for i in range(min(10, len(out))):
+        row_values = [str(x).strip() for x in out.iloc[i].tolist()]
+        if any(k in v for k in keywords for v in row_values):
+            header_idx = i
+            break
+
+    raw_columns = [str(c).replace('\n', '').replace('\r', '').strip() for c in out.iloc[header_idx].tolist()]
+    out.columns = raw_columns
+    out = out.iloc[header_idx + 1:].reset_index(drop=True)
     out = out.dropna(how="all")
 
-    first_col_values_to_drop = {
-        "분류", "아이디", "손님 ID", "등급", "이름", "설거지 소요 시간", "Upgrade_Type", "Recipe_ID", "Fish_ID",
-    }
-    row_tokens_to_drop = {
-        "분류", "레벨", "비용", "등급", "이름", "Int", "Float", "Enum", "String", "string", "int", "float", "enum",
-        "자료형", "계산 방식", "아이디", "텍스트 ID", "다음단계필요재화", "값", "참조아이디", "효과 값 1", "효과 값 2",
-        "설거지 소요 시간", "최소 입장 딜레이", "최대 입장 딜레이", "한글 이름", "영어 이름", "가중치", "출입 속도",
-        "첫 번째 주문 시간", "첫 번째 먹는 시간", "두 번째 주문 확률", "두 번째 주문 시간", "두 번째 먹는 시간",
-        "세 번째 주문 확률", "세 번째 주문 시간", "세 번째 먹는 시간", "팁 확률", "팁 배수", "정가", "생산량", "재료",
-    }
+    for col in out.columns:
+        clean_col = col.replace(" ", "").replace("_", "").lower()
+        if clean_col == "upgradetype":
+            out.rename(columns={col: "Upgrade_Type"}, inplace=True)
+        elif clean_col == "level":
+            out.rename(columns={col: "Level"}, inplace=True)
+
+    first_col_values_to_drop = {"분류", "아이디", "손님 ID", "등급", "이름", "설거지 소요 시간", "Upgrade_Type", "Recipe_ID", "Fish_ID"}
+    row_tokens_to_drop = {"분류", "레벨", "비용", "등급", "이름", "Int", "Float", "Enum", "String", "string", "int", "float", "enum", "자료형", "계산 방식", "아이디", "텍스트 ID", "다음단계필요재화", "값", "참조아이디", "효과 값 1", "효과 값 2", "설거지 소요 시간", "최소 입장 딜레이", "최대 입장 딜레이", "한글 이름", "영어 이름", "가중치", "출입 속도", "첫 번째 주문 시간", "첫 번째 먹는 시간", "두 번째 주문 확률", "두 번째 주문 시간", "두 번째 먹는 시간", "세 번째 주문 확률", "세 번째 주문 시간", "세 번째 먹는 시간", "팁 확률", "팁 배수", "정가", "생산량", "재료"}
 
     def is_meta_row(row: pd.Series) -> bool:
         vals = [str(v).strip() for v in row.tolist() if pd.notna(v)]
@@ -112,7 +123,7 @@ def load_all_data(fishing_id: str, restaurant_id: str, guest_id: str) -> Dict[st
     restaurant_sheets = pd.read_excel(restaurant_url, sheet_name=None, header=None)
     guest_sheets = pd.read_excel(guest_url, sheet_name=None, header=None)
 
-    return {
+    tables = {
         "restaurant_upg": clean_table(restaurant_sheets["Restaurant_UPG_Data"]),
         "restaurant_settings": clean_table(restaurant_sheets["Restaurant_UPG_Setting"]),
         "recipes": clean_table(restaurant_sheets["Recipe_Data"]),
@@ -124,6 +135,14 @@ def load_all_data(fishing_id: str, restaurant_id: str, guest_id: str) -> Dict[st
         "guest_actions": clean_table(guest_sheets["Customer_Action"]),
         "guest_tips": clean_table(guest_sheets["Customer_Tips"]),
     }
+    
+    # 메뉴 슬롯 업그레이드 시트 (Menu_UPG_Data) 로드
+    if "Menu_UPG_Data" in restaurant_sheets:
+        tables["menu_upg"] = clean_table(restaurant_sheets["Menu_UPG_Data"])
+    else:
+        tables["menu_upg"] = pd.DataFrame(columns=["Level", "Effect_Value_Int"])
+
+    return tables
 
 
 # ---------------- helpers ----------------
@@ -137,10 +156,21 @@ def to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
 
 
 def get_upgrade_ranges(upg_df: pd.DataFrame, settings_df: pd.DataFrame) -> Dict[str, tuple[int, int]]:
+    if "Upgrade_Type" not in upg_df.columns or "Level" not in upg_df.columns:
+        st.error(f"🚨 **[데이터 로드 오류]** 시트에서 'Upgrade_Type' 또는 'Level' 컬럼을 찾지 못했습니다.")
+        st.info(f"👉 **파이썬이 읽어들인 실제 컬럼명:** {upg_df.columns.tolist()}")
+        st.warning("구글 시트의 첫 번째 줄(헤더)에 오타가 있거나, '분류' 같은 한글로 되어있는지 확인해 주세요!")
+        st.stop() 
+
     settings_df = to_numeric(settings_df, ["Max_Level"])
-    max_from_settings = settings_df.set_index("Upgrade_Type")["Max_Level"].dropna().astype(int).to_dict()
+    if "Upgrade_Type" not in settings_df.columns:
+        max_from_settings = {}
+    else:
+        max_from_settings = settings_df.set_index("Upgrade_Type")["Max_Level"].dropna().astype(int).to_dict()
+        
     upg_df = to_numeric(upg_df, ["Level"])
     max_from_data = upg_df.groupby("Upgrade_Type")["Level"].max().dropna().astype(int).to_dict()
+    
     keys = sorted(set(max_from_settings) | set(max_from_data))
     return {k: (1, int(max(max_from_settings.get(k, 1), max_from_data.get(k, 1)))) for k in keys}
 
@@ -222,12 +252,12 @@ def build_fishing_maps(tables: Dict[str, pd.DataFrame]):
 def build_recipe_maps(recipes_df: pd.DataFrame, levels: Dict[str, int], restaurant_upg_df: pd.DataFrame):
     recipes_df = to_numeric(recipes_df, ["Price", "Yield"])
     bonus_food = (
-        get_upgrade_value(restaurant_upg_df, "Bonus_Food_1", levels["Bonus_Food_1"], "Effect_Value_Int")
-        + get_upgrade_value(restaurant_upg_df, "Bonus_Food_2", levels["Bonus_Food_2"], "Effect_Value_Int")
+        get_upgrade_value(restaurant_upg_df, "Bonus_Food_1", levels.get("Bonus_Food_1", 1), "Effect_Value_Int")
+        + get_upgrade_value(restaurant_upg_df, "Bonus_Food_2", levels.get("Bonus_Food_2", 1), "Effect_Value_Int")
     )
     price_bonus = (
-        get_upgrade_value(restaurant_upg_df, "Bonus_Dish_Price_1", levels["Bonus_Dish_Price_1"], "Effect_Value_Float")
-        + get_upgrade_value(restaurant_upg_df, "Bonus_Dish_Price_2", levels["Bonus_Dish_Price_2"], "Effect_Value_Float")
+        get_upgrade_value(restaurant_upg_df, "Bonus_Dish_Price_1", levels.get("Bonus_Dish_Price_1", 1), "Effect_Value_Float")
+        + get_upgrade_value(restaurant_upg_df, "Bonus_Dish_Price_2", levels.get("Bonus_Dish_Price_2", 1), "Effect_Value_Float")
     )
 
     fish_to_recipe: Dict[str, str] = {}
@@ -244,7 +274,6 @@ def build_recipe_maps(recipes_df: pd.DataFrame, levels: Dict[str, int], restaura
     return fish_to_recipe, recipe_price, recipe_yield
 
 
-# 💡 전체 손님 풀 생성 로직 수정 (업그레이드와 무관하게 모든 시트 데이터 로드)
 def build_customer_pool(tables: Dict[str, pd.DataFrame], levels: Dict[str, int]) -> List[CustomerProfile]:
     actions = to_numeric(
         tables["guest_actions"],
@@ -261,17 +290,19 @@ def build_customer_pool(tables: Dict[str, pd.DataFrame], levels: Dict[str, int])
             "multi": float(row.get("Tips_Multi") or 0.0),
         }
 
-    special_weight_bonus = float(get_upgrade_value(tables["restaurant_upg"], "Weight", levels["Weight"], "Effect_Value_Int"))
-    tip_bonus_multi = float(get_upgrade_value(tables["restaurant_upg"], "Bonus_Tips_Multi", levels["Bonus_Tips_Multi"], "Effect_Value_Float"))
+    special_weight_bonus = float(get_upgrade_value(tables["restaurant_upg"], "Weight", levels.get("Weight", 1), "Effect_Value_Int"))
+    tip_bonus_multi = float(get_upgrade_value(tables["restaurant_upg"], "Bonus_Tips_Multi", levels.get("Bonus_Tips_Multi", 1), "Effect_Value_Float"))
 
     pool: List[CustomerProfile] = []
-    # 시트에 있는 모든 손님 로드
     for _, row in actions.iterrows():
-        cid = int(float(row["Customer_ID"]))
+        try:
+            cid = int(float(row["Customer_ID"]))
+        except ValueError:
+            continue
+            
         grade = str(row["Grade"]).strip()
         weight = float(row.get("Weight") or 0.0)
         
-        # Weight 보너스는 Special/VIP에게 적용
         if grade in ["Special", "VIP"]:
             weight += special_weight_bonus
             
@@ -297,23 +328,18 @@ def build_customer_pool(tables: Dict[str, pd.DataFrame], levels: Dict[str, int])
     return pool
 
 
-# 💡 스폰 제한을 실시간으로 반영하여 손님을 픽하는 로직으로 변경
 def pick_customer(pool: List[CustomerProfile], rng: random.Random, 
                   current_special: int, max_special: int, 
                   current_vip: int, max_vip: int) -> CustomerProfile:
     available_pool = []
     
     for c in pool:
-        # 현재 앉아 있는 Special 손님 수가 제한값에 도달했다면 Pool에서 제외
         if c.grade == "Special" and current_special >= max_special:
             continue
-        # 현재 앉아 있는 VIP 손님 수가 제한값에 도달했다면 Pool에서 제외
         if c.grade == "VIP" and current_vip >= max_vip:
             continue
-            
         available_pool.append(c)
 
-    # 필터링된 풀이 혹시라도 비어있다면 전체 풀에서 랜덤 선택 (예외 처리)
     if not available_pool:
         available_pool = pool
         
@@ -345,23 +371,30 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     fixed_df = to_numeric(tables["fixed"], ["DishWashTime", "MinSpawnDelay", "MaxSpawnDelay"])
     fixed_row = fixed_df.iloc[0]
 
-    bait_seconds = int(get_upgrade_value(fishing_upg, "BaitMaking", levels["BaitMaking"], "Effect_Value_Int"))
-    rod_capacity = int(get_upgrade_value(fishing_upg, "FishingRod", levels["FishingRod"], "Effect_Value_Int"))
-    ship_capacity = int(get_upgrade_value(fishing_upg, "Ship", levels["Ship"], "Effect_Value_Int"))
-    seat_count = int(get_upgrade_value(restaurant_upg, "Max_Customer_Limit", levels["Max_Customer_Limit"], "Effect_Value_Int"))
+    bait_seconds = int(get_upgrade_value(fishing_upg, "BaitMaking", levels.get("BaitMaking", 1), "Effect_Value_Int"))
+    rod_capacity = int(get_upgrade_value(fishing_upg, "FishingRod", levels.get("FishingRod", 1), "Effect_Value_Int"))
+    ship_capacity = int(get_upgrade_value(fishing_upg, "Ship", levels.get("Ship", 1), "Effect_Value_Int"))
+    seat_count = int(get_upgrade_value(restaurant_upg, "Max_Customer_Limit", levels.get("Max_Customer_Limit", 1), "Effect_Value_Int"))
     seat_count = max(seat_count, 1)
 
-    # 💡 제한값 가져오기 (0레벨/1레벨일 때 0이면 안 나오게 처리됨)
-    max_special_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_1", levels["Max_Spawn_Limit_1"], "Effect_Value_Int"))
-    max_vip_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_2", levels["Max_Spawn_Limit_2"], "Effect_Value_Int"))
+    max_special_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_1", levels.get("Max_Spawn_Limit_1", 1), "Effect_Value_Int"))
+    max_vip_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_2", levels.get("Max_Spawn_Limit_2", 1), "Effect_Value_Int"))
 
-    active_rate_id = get_rate_id_for_player_grade(fishing_upg, levels["PlayerGrade"])
+    # 💡 메뉴 슬롯 제한값 세팅
+    menu_upg = tables.get("menu_upg", pd.DataFrame())
+    if not menu_upg.empty and "Level" in menu_upg.columns and "Effect_Value_Int" in menu_upg.columns:
+        menu_df = to_numeric(menu_upg, ["Level", "Effect_Value_Int"])
+        menu_row = menu_df[menu_df["Level"] == levels.get("Menu_Level", 1)]
+        max_menu_slots = int(menu_row.iloc[0]["Effect_Value_Int"]) if not menu_row.empty else 2
+    else:
+        max_menu_slots = 2
+
+    active_rate_id = get_rate_id_for_player_grade(fishing_upg, levels.get("PlayerGrade", 1))
     rate_map, rarity_to_fish, fish_rarity = build_fishing_maps(tables)
     if active_rate_id not in rate_map:
         raise KeyError(f"Fishing_Rate_Data에 {active_rate_id}가 없습니다.")
     fish_to_recipe, recipe_price, recipe_yield = build_recipe_maps(tables["recipes"], levels, restaurant_upg)
     
-    # 전체 1~20 풀 로드
     customer_pool = build_customer_pool(tables, levels)
 
     tickets = rod_capacity
@@ -422,11 +455,21 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         peak_dish_stock = max(peak_dish_stock, total_dish_inventory())
 
     def consume_random_dish() -> Optional[str]:
+        # 재고가 있는 전체 메뉴 리스트
         available = [rid for rid, cnt in dish_inventory.items() if cnt > 0]
         if not available:
             return None
-        rid = rng.choice(available)
+            
+        # 💡 최적의 플레이어를 모방하여 가격이 가장 비싼 순으로 내림차순 정렬
+        available.sort(key=lambda x: recipe_price.get(x, 0.0), reverse=True)
+        
+        # 현재 메뉴판(Menu Slots)에 등록된 요리들 (최대 N개 제한)
+        current_menu = available[:max_menu_slots]
+        
+        # 손님은 "메뉴판에 있는" 요리 중 하나를 무작위로 선택함
+        rid = rng.choice(current_menu)
         dish_inventory[rid] -= 1
+        
         if dish_inventory[rid] <= 0:
             del dish_inventory[rid]
         return rid
@@ -435,11 +478,9 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         nonlocal customers_spawned, special_spawned, vip_spawned, reserved_dishes
         reserved_dishes += 1  
         
-        # 💡 현재 좌석을 돌며 Special과 VIP 손님 수를 계산
         current_special = sum(1 for s in seats if s.customer and s.customer.grade == "Special")
         current_vip = sum(1 for s in seats if s.customer and s.customer.grade == "VIP")
         
-        # 제한값을 실시간으로 넘겨 동적으로 풀에서 제외 후 뽑기 진행
         customer = pick_customer(customer_pool, rng, current_special, max_special_limit, current_vip, max_vip_limit)
         
         seat.customer = customer
@@ -656,9 +697,9 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
 
 def sort_by_numeric_id(item):
     try:
-        return int(item)
+        return (0, int(item))
     except ValueError:
-        return item
+        return (1, str(item))
 
 
 def run_multiple_simulations(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], total_seconds: int, wait_after_full_seconds: int, base_seed: int, num_runs: int = 10) -> SimSummary:
@@ -674,15 +715,23 @@ def run_multiple_simulations(tables: Dict[str, pd.DataFrame], levels: Dict[str, 
 
     rarity_df = pd.concat([s.rarity_breakdown for s in summaries]).groupby("Rarity", as_index=False)["Count"].mean()
     
-    fish_df = pd.concat([s.fish_breakdown for s in summaries]).groupby("Fish_ID", as_index=False)["Count"].sum()
-    fish_df["Count"] = fish_df["Count"] / num_runs # 총합을 실행 횟수로 나눔
-    fish_df["_sort_key"] = fish_df["Fish_ID"].apply(sort_by_numeric_id)
-    fish_df = fish_df.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+    fish_concat = pd.concat([s.fish_breakdown for s in summaries])
+    if not fish_concat.empty:
+        fish_df = fish_concat.groupby("Fish_ID", as_index=False)["Count"].sum()
+        fish_df["Count"] = fish_df["Count"] / num_runs
+        fish_df["_sort_key"] = fish_df["Fish_ID"].apply(sort_by_numeric_id)
+        fish_df = fish_df.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+    else:
+        fish_df = fish_concat
 
-    recipe_df = pd.concat([s.recipe_breakdown for s in summaries]).groupby("Recipe_ID", as_index=False)["Cooked_Count"].sum()
-    recipe_df["Cooked_Count"] = recipe_df["Cooked_Count"] / num_runs # 총합을 실행 횟수로 나눔
-    recipe_df["_sort_key"] = recipe_df["Recipe_ID"].apply(sort_by_numeric_id)
-    recipe_df = recipe_df.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+    recipe_concat = pd.concat([s.recipe_breakdown for s in summaries])
+    if not recipe_concat.empty:
+        recipe_df = recipe_concat.groupby("Recipe_ID", as_index=False)["Cooked_Count"].sum()
+        recipe_df["Cooked_Count"] = recipe_df["Cooked_Count"] / num_runs 
+        recipe_df["_sort_key"] = recipe_df["Recipe_ID"].apply(sort_by_numeric_id)
+        recipe_df = recipe_df.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+    else:
+        recipe_df = recipe_concat
 
     return SimSummary(
         fish_caught=get_avg("fish_caught"),
@@ -761,6 +810,15 @@ def main() -> None:
                 levels[key] = st.slider(key, lo, hi, lo)
     with col2:
         st.subheader("Restaurant")
+        
+        # 💡 메뉴 슬롯 업그레이드 슬라이더 추가
+        if "menu_upg" in tables and not tables["menu_upg"].empty:
+            menu_df = to_numeric(tables["menu_upg"], ["Level"])
+            menu_max = menu_df["Level"].max() if not menu_df["Level"].dropna().empty else 9
+            levels["Menu_Level"] = st.slider("Menu_Level (메뉴 슬롯 제한)", 1, int(menu_max), 1)
+        else:
+            levels["Menu_Level"] = 1
+
         for key in [
             "Master_Lv", "Max_Customer_Limit", "Max_Spawn_Limit_1", "Max_Spawn_Limit_2", "Weight",
             "Bonus_Tips_Multi", "Bonus_Dish_Price_1", "Bonus_Dish_Price_2", "Bonus_Food_1", "Bonus_Food_2",
@@ -774,7 +832,7 @@ def main() -> None:
     with st.spinner(f"시뮬레이션을 {num_runs}회 반복 실행하며 평균을 계산 중입니다..."):
         result = run_multiple_simulations(tables, levels, total_seconds, wait_after_full_seconds, int(base_seed), int(num_runs))
 
-    st.info(f"현재 PlayerGrade {levels['PlayerGrade']} → 참조 Rate_ID: **{result.active_rate_id}** (총 {num_runs}회 평균 데이터)")
+    st.info(f"현재 PlayerGrade {levels.get('PlayerGrade', 1)} → 참조 Rate_ID: **{result.active_rate_id}** (총 {num_runs}회 평균 데이터)")
 
     m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("총수익 (평균)", f"{result.total_sales:,.0f}")
@@ -840,7 +898,7 @@ def main() -> None:
         st.dataframe(result.recipe_breakdown.round(1), use_container_width=True)
 
     with st.expander("원본 데이터 미리보기"):
-        tabs = st.tabs(["Fishing_UPG", "Rates", "Fish", "Restaurant_UPG", "Recipes", "Guest_Actions", "Guest_Tips"])
+        tabs = st.tabs(["Fishing_UPG", "Rates", "Fish", "Restaurant_UPG", "Menu_UPG", "Recipes", "Guest_Actions", "Guest_Tips"])
         with tabs[0]:
             st.dataframe(tables["fishing_upg"], use_container_width=True)
         with tabs[1]:
@@ -850,10 +908,12 @@ def main() -> None:
         with tabs[3]:
             st.dataframe(tables["restaurant_upg"], use_container_width=True)
         with tabs[4]:
-            st.dataframe(tables["recipes"], use_container_width=True)
+            st.dataframe(tables["menu_upg"], use_container_width=True)
         with tabs[5]:
-            st.dataframe(tables["guest_actions"], use_container_width=True)
+            st.dataframe(tables["recipes"], use_container_width=True)
         with tabs[6]:
+            st.dataframe(tables["guest_actions"], use_container_width=True)
+        with tabs[7]:
             st.dataframe(tables["guest_tips"], use_container_width=True)
 
 
