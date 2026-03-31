@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import random
 import re
+from collections import Counter
 
 import numpy as np
 import pandas as pd
@@ -12,9 +13,6 @@ import streamlit as st
 SECONDS_PER_DAY = 24 * 60 * 60
 HALF_TRIP_AT_V1 = 17.61 / 2.0
 RARITY_COLS = ["Trash", "Normal", "Fine", "Superior", "Rare", "Elite", "Fantastic", "Legendary"]
-BASE_CUSTOMER_POOL = list(range(1, 15)) + [18, 19]
-SPECIAL_EXTRA_ORDER = [15, 16, 17]
-VIP_EXTRA_ORDER = [20]
 
 
 @dataclass
@@ -41,31 +39,31 @@ class SeatState:
         self.timer = 0.0
         self.customer: Optional[CustomerProfile] = None
         self.orders_completed = 0
-        self.has_eaten = False # 식사 여부 (유령 설거지 방지용)
+        self.has_eaten = False 
         self.current_recipe_id: Optional[str] = None
 
 
 @dataclass
 class SimSummary:
-    fish_caught: int
-    fishing_sessions: int
-    tickets_spent: int
-    fish_left_in_inventory: int
-    dishes_cooked: int
-    dishes_sold: int
+    fish_caught: float
+    fishing_sessions: float
+    tickets_spent: float
+    fish_left_in_inventory: float
+    dishes_cooked: float
+    dishes_sold: float
     gross_sales: float
     tips_sales: float
     total_sales: float
-    customers_spawned: int
-    customers_completed: int
-    special_spawned: int
-    vip_spawned: int
-    peak_fish_inventory: int
-    peak_dish_stock: int
-    remaining_tickets: int
-    remaining_dishes: int
-    restaurant_idle_seconds: int
-    out_of_stock_seconds: int
+    customers_spawned: float
+    customers_completed: float
+    special_spawned: float
+    vip_spawned: float
+    peak_fish_inventory: float
+    peak_dish_stock: float
+    remaining_tickets: float
+    remaining_dishes: float
+    restaurant_idle_seconds: float
+    out_of_stock_seconds: float
     bottleneck: str
     active_rate_id: str
     rarity_breakdown: pd.DataFrame
@@ -246,6 +244,7 @@ def build_recipe_maps(recipes_df: pd.DataFrame, levels: Dict[str, int], restaura
     return fish_to_recipe, recipe_price, recipe_yield
 
 
+# 💡 전체 손님 풀 생성 로직 수정 (업그레이드와 무관하게 모든 시트 데이터 로드)
 def build_customer_pool(tables: Dict[str, pd.DataFrame], levels: Dict[str, int]) -> List[CustomerProfile]:
     actions = to_numeric(
         tables["guest_actions"],
@@ -257,32 +256,25 @@ def build_customer_pool(tables: Dict[str, pd.DataFrame], levels: Dict[str, int])
     tips = to_numeric(tables["guest_tips"], ["Tips_Rate", "Tips_Multi"])
     tips_by_grade = {}
     for _, row in tips.iterrows():
-        tips_by_grade[str(row["Grade"])] = {
+        tips_by_grade[str(row["Grade"]).strip()] = {
             "rate": normalize_rate(row.get("Tips_Rate") or 0.0),
             "multi": float(row.get("Tips_Multi") or 0.0),
         }
 
-    special_effect = int(get_upgrade_value(tables["restaurant_upg"], "Max_Spawn_Limit_1", levels["Max_Spawn_Limit_1"], "Effect_Value_Int"))
-    vip_effect = int(get_upgrade_value(tables["restaurant_upg"], "Max_Spawn_Limit_2", levels["Max_Spawn_Limit_2"], "Effect_Value_Int"))
     special_weight_bonus = float(get_upgrade_value(tables["restaurant_upg"], "Weight", levels["Weight"], "Effect_Value_Int"))
     tip_bonus_multi = float(get_upgrade_value(tables["restaurant_upg"], "Bonus_Tips_Multi", levels["Bonus_Tips_Multi"], "Effect_Value_Float"))
 
-    allowed_ids = list(BASE_CUSTOMER_POOL)
-    for i in range(min(special_effect, len(SPECIAL_EXTRA_ORDER))):
-        allowed_ids.append(SPECIAL_EXTRA_ORDER[i])
-    for i in range(min(vip_effect, len(VIP_EXTRA_ORDER))):
-        allowed_ids.append(VIP_EXTRA_ORDER[i])
-    allowed_ids = set(allowed_ids)
-
     pool: List[CustomerProfile] = []
+    # 시트에 있는 모든 손님 로드
     for _, row in actions.iterrows():
         cid = int(float(row["Customer_ID"]))
-        if cid not in allowed_ids:
-            continue
-        grade = str(row["Grade"])
+        grade = str(row["Grade"]).strip()
         weight = float(row.get("Weight") or 0.0)
-        if grade == "Special":
+        
+        # Weight 보너스는 Special/VIP에게 적용
+        if grade in ["Special", "VIP"]:
             weight += special_weight_bonus
+            
         tip_info = tips_by_grade.get(grade, {"rate": 0.0, "multi": 0.0})
         pool.append(
             CustomerProfile(
@@ -305,9 +297,28 @@ def build_customer_pool(tables: Dict[str, pd.DataFrame], levels: Dict[str, int])
     return pool
 
 
-def pick_customer(pool: List[CustomerProfile], rng: random.Random) -> CustomerProfile:
-    weights = [c.weight for c in pool]
-    return rng.choices(pool, weights=weights, k=1)[0]
+# 💡 스폰 제한을 실시간으로 반영하여 손님을 픽하는 로직으로 변경
+def pick_customer(pool: List[CustomerProfile], rng: random.Random, 
+                  current_special: int, max_special: int, 
+                  current_vip: int, max_vip: int) -> CustomerProfile:
+    available_pool = []
+    
+    for c in pool:
+        # 현재 앉아 있는 Special 손님 수가 제한값에 도달했다면 Pool에서 제외
+        if c.grade == "Special" and current_special >= max_special:
+            continue
+        # 현재 앉아 있는 VIP 손님 수가 제한값에 도달했다면 Pool에서 제외
+        if c.grade == "VIP" and current_vip >= max_vip:
+            continue
+            
+        available_pool.append(c)
+
+    # 필터링된 풀이 혹시라도 비어있다면 전체 풀에서 랜덤 선택 (예외 처리)
+    if not available_pool:
+        available_pool = pool
+        
+    weights = [c.weight for c in available_pool]
+    return rng.choices(available_pool, weights=weights, k=1)[0]
 
 
 def pick_rarity_and_fish(rate_probs: np.ndarray, rarity_to_fish: Dict[str, List[str]], rng: random.Random):
@@ -340,11 +351,17 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     seat_count = int(get_upgrade_value(restaurant_upg, "Max_Customer_Limit", levels["Max_Customer_Limit"], "Effect_Value_Int"))
     seat_count = max(seat_count, 1)
 
+    # 💡 제한값 가져오기 (0레벨/1레벨일 때 0이면 안 나오게 처리됨)
+    max_special_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_1", levels["Max_Spawn_Limit_1"], "Effect_Value_Int"))
+    max_vip_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_2", levels["Max_Spawn_Limit_2"], "Effect_Value_Int"))
+
     active_rate_id = get_rate_id_for_player_grade(fishing_upg, levels["PlayerGrade"])
     rate_map, rarity_to_fish, fish_rarity = build_fishing_maps(tables)
     if active_rate_id not in rate_map:
         raise KeyError(f"Fishing_Rate_Data에 {active_rate_id}가 없습니다.")
     fish_to_recipe, recipe_price, recipe_yield = build_recipe_maps(tables["recipes"], levels, restaurant_upg)
+    
+    # 전체 1~20 풀 로드
     customer_pool = build_customer_pool(tables, levels)
 
     tickets = rod_capacity
@@ -372,6 +389,7 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     reserved_dishes = 0
 
     seats = [SeatState() for _ in range(seat_count)]
+    exiting_timers: List[Tuple[float, bool]] = []
 
     next_charge_at = bait_seconds
     next_visit_at = None
@@ -385,7 +403,6 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         return sum(dish_inventory.values())
 
     def can_spawn_customer() -> bool:
-        # 💡 FIX 1: 유령 손님 방지 (재고에서 이미 예약된 분량을 빼고 계산)
         return (total_dish_inventory() - reserved_dishes) > 0
 
     def convert_all_fish_to_dishes() -> None:
@@ -416,12 +433,18 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
 
     def start_customer_for_seat(seat: SeatState) -> None:
         nonlocal customers_spawned, special_spawned, vip_spawned, reserved_dishes
-        reserved_dishes += 1  # 💡 손님이 스폰될 때 미리 재고 하나를 찜함
+        reserved_dishes += 1  
         
-        customer = pick_customer(customer_pool, rng)
+        # 💡 현재 좌석을 돌며 Special과 VIP 손님 수를 계산
+        current_special = sum(1 for s in seats if s.customer and s.customer.grade == "Special")
+        current_vip = sum(1 for s in seats if s.customer and s.customer.grade == "VIP")
+        
+        # 제한값을 실시간으로 넘겨 동적으로 풀에서 제외 후 뽑기 진행
+        customer = pick_customer(customer_pool, rng, current_special, max_special_limit, current_vip, max_vip_limit)
+        
         seat.customer = customer
         seat.orders_completed = 0
-        seat.has_eaten = False # 식사 상태 초기화
+        seat.has_eaten = False 
         seat.phase = "walking_to_seat"
         seat.timer = HALF_TRIP_AT_V1 / max(customer.flow_velocity, 0.0001)
         
@@ -434,19 +457,20 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     def begin_order(seat: SeatState, order_num: int) -> None:
         nonlocal reserved_dishes
         
-        # 💡 첫 번째 주문일 경우 스폰될 때 찜해둔 예약을 해제 (실제 차감 시도)
         if order_num == 1:
             reserved_dishes -= 1
             
         recipe_id = consume_random_dish()
         
-        # 음식이 없으면 화내면서 바로 퇴장
         if recipe_id is None:
-            seat.phase = "walking_to_despawn"
-            seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+            exit_time = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+            exiting_timers.append((exit_time, False))
+            
+            seat.phase = "spawn_delay"
+            seat.timer = random_delay(tables["fixed"], rng)
+            seat.customer = None
             return
             
-        # 음식을 받았으므로 식사 상태 True
         seat.has_eaten = True
         seat.orders_completed = order_num
         seat.phase = f"waiting_order_{order_num}"
@@ -461,7 +485,6 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         seat.current_recipe_id = recipe_id
 
     for t in range(1, total_seconds + 1):
-        # 낚시 티켓 충전
         if bait_seconds > 0 and t >= next_charge_at:
             while t >= next_charge_at:
                 if tickets < rod_capacity:
@@ -470,7 +493,6 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
                         next_visit_at = t + wait_after_full_seconds
                 next_charge_at += bait_seconds
 
-        # 낚시터 방문
         if next_visit_at is not None and t >= next_visit_at:
             fishing_sessions += 1
             available_space = max(ship_capacity - total_fish_inventory(), 0)
@@ -490,7 +512,16 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
             if tickets >= rod_capacity:
                 next_visit_at = t + wait_after_full_seconds
 
-        # 💡 FIX 3: 매장 유휴 시간과 재고 고갈 시간 분리
+        new_exiting = []
+        for t_exit, has_eaten in exiting_timers:
+            t_exit -= 1.0
+            if t_exit <= 0:
+                if has_eaten:
+                    customers_completed += 1
+            else:
+                new_exiting.append((t_exit, has_eaten))
+        exiting_timers = new_exiting
+
         if total_dish_inventory() <= 0:
             out_of_stock_seconds += 1
             
@@ -517,11 +548,16 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
                 if rng.random() < seat.customer.tips_rate:
                     tips_sales += price * seat.customer.tips_multi
                 dishes_sold += 1
+                
                 if total_dish_inventory() > 0 and rng.random() < seat.customer.second_order_rate:
                     begin_order(seat, 2)
                 else:
-                    seat.phase = "walking_to_despawn"
-                    seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+                    exit_time = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+                    exiting_timers.append((exit_time, True))
+                    seat.phase = "dishwashing"
+                    seat.timer = float(fixed_row["DishWashTime"])
+                    seat.customer = None
+                    seat.current_recipe_id = None
             elif seat.phase == "waiting_order_2":
                 seat.phase = "eating_2"
                 seat.timer = seat.customer.second_eat_time
@@ -531,11 +567,16 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
                 if rng.random() < seat.customer.tips_rate:
                     tips_sales += price * seat.customer.tips_multi
                 dishes_sold += 1
+                
                 if total_dish_inventory() > 0 and rng.random() < seat.customer.third_order_rate:
                     begin_order(seat, 3)
                 else:
-                    seat.phase = "walking_to_despawn"
-                    seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+                    exit_time = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+                    exiting_timers.append((exit_time, True))
+                    seat.phase = "dishwashing"
+                    seat.timer = float(fixed_row["DishWashTime"])
+                    seat.customer = None
+                    seat.current_recipe_id = None
             elif seat.phase == "waiting_order_3":
                 seat.phase = "eating_3"
                 seat.timer = seat.customer.third_eat_time
@@ -545,18 +586,11 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
                 if rng.random() < seat.customer.tips_rate:
                     tips_sales += price * seat.customer.tips_multi
                 dishes_sold += 1
-                seat.phase = "walking_to_despawn"
-                seat.timer = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
-            elif seat.phase == "walking_to_despawn":
-                # 💡 FIX 2: 요리를 하나라도 먹은 손님만 완료 처리 및 설거지 진행
-                if seat.has_eaten:
-                    customers_completed += 1
-                    seat.phase = "dishwashing"
-                    seat.timer = float(fixed_row["DishWashTime"])
-                else:
-                    seat.phase = "spawn_delay"
-                    seat.timer = random_delay(tables["fixed"], rng)
                 
+                exit_time = HALF_TRIP_AT_V1 / max(seat.customer.flow_velocity, 0.0001)
+                exiting_timers.append((exit_time, True))
+                seat.phase = "dishwashing"
+                seat.timer = float(fixed_row["DishWashTime"])
                 seat.customer = None
                 seat.current_recipe_id = None
             elif seat.phase == "dishwashing":
@@ -572,7 +606,6 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     fish_left_in_inventory = total_fish_inventory()
     total_sales = gross_sales + tips_sales
 
-    # 💡 FIX 3 연장선: 고도화된 병목 판정 조건 적용
     if dishes_sold == 0 and fish_caught == 0:
         bottleneck = "낚시 방문 주기/인벤토리 병목"
     elif out_of_stock_seconds > total_seconds * 0.1 and remaining_dishes == 0:
@@ -583,37 +616,96 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         bottleneck = "손님 유입 병목 (마케팅/스폰 부족)"
 
     rarity_df = pd.DataFrame({"Rarity": list(rarity_counter.keys()), "Count": list(rarity_counter.values())})
-    fish_df = pd.DataFrame(sorted(fish_counter.items(), key=lambda x: (-x[1], x[0])), columns=["Fish_ID", "Count"])
+    fish_df = pd.DataFrame(list(fish_counter.items()), columns=["Fish_ID", "Count"])
 
     recipe_counter = {}
     for fish_id, count in fish_counter.items():
         recipe_id = fish_to_recipe.get(fish_id)
         if recipe_id:
             recipe_counter[recipe_id] = recipe_counter.get(recipe_id, 0) + count * recipe_yield[recipe_id]
-    recipe_df = pd.DataFrame(sorted(recipe_counter.items(), key=lambda x: (-x[1], x[0])), columns=["Recipe_ID", "Cooked_Count"])
+            
+    recipe_df = pd.DataFrame(list(recipe_counter.items()), columns=["Recipe_ID", "Cooked_Count"])
 
     return SimSummary(
-        fish_caught=fish_caught,
-        fishing_sessions=fishing_sessions,
-        tickets_spent=tickets_spent,
-        fish_left_in_inventory=fish_left_in_inventory,
-        dishes_cooked=dishes_cooked,
-        dishes_sold=dishes_sold,
-        gross_sales=gross_sales,
-        tips_sales=tips_sales,
-        total_sales=total_sales,
-        customers_spawned=customers_spawned,
-        customers_completed=customers_completed,
-        special_spawned=special_spawned,
-        vip_spawned=vip_spawned,
-        peak_fish_inventory=peak_fish_inventory,
-        peak_dish_stock=peak_dish_stock,
-        remaining_tickets=remaining_tickets,
-        remaining_dishes=remaining_dishes,
-        restaurant_idle_seconds=restaurant_idle_seconds,
-        out_of_stock_seconds=out_of_stock_seconds,
+        fish_caught=float(fish_caught),
+        fishing_sessions=float(fishing_sessions),
+        tickets_spent=float(tickets_spent),
+        fish_left_in_inventory=float(fish_left_in_inventory),
+        dishes_cooked=float(dishes_cooked),
+        dishes_sold=float(dishes_sold),
+        gross_sales=float(gross_sales),
+        tips_sales=float(tips_sales),
+        total_sales=float(total_sales),
+        customers_spawned=float(customers_spawned),
+        customers_completed=float(customers_completed),
+        special_spawned=float(special_spawned),
+        vip_spawned=float(vip_spawned),
+        peak_fish_inventory=float(peak_fish_inventory),
+        peak_dish_stock=float(peak_dish_stock),
+        remaining_tickets=float(remaining_tickets),
+        remaining_dishes=float(remaining_dishes),
+        restaurant_idle_seconds=float(restaurant_idle_seconds),
+        out_of_stock_seconds=float(out_of_stock_seconds),
         bottleneck=bottleneck,
         active_rate_id=active_rate_id,
+        rarity_breakdown=rarity_df,
+        fish_breakdown=fish_df,
+        recipe_breakdown=recipe_df,
+    )
+
+
+def sort_by_numeric_id(item):
+    try:
+        return int(item)
+    except ValueError:
+        return item
+
+
+def run_multiple_simulations(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], total_seconds: int, wait_after_full_seconds: int, base_seed: int, num_runs: int = 10) -> SimSummary:
+    summaries = []
+    for i in range(num_runs):
+        summaries.append(run_simulation(tables, levels, total_seconds, wait_after_full_seconds, base_seed + i))
+
+    def get_avg(field: str) -> float:
+        return sum(getattr(s, field) for s in summaries) / num_runs
+
+    bottlenecks = [s.bottleneck for s in summaries]
+    common_bottleneck = Counter(bottlenecks).most_common(1)[0][0]
+
+    rarity_df = pd.concat([s.rarity_breakdown for s in summaries]).groupby("Rarity", as_index=False)["Count"].mean()
+    
+    fish_df = pd.concat([s.fish_breakdown for s in summaries]).groupby("Fish_ID", as_index=False)["Count"].sum()
+    fish_df["Count"] = fish_df["Count"] / num_runs # 총합을 실행 횟수로 나눔
+    fish_df["_sort_key"] = fish_df["Fish_ID"].apply(sort_by_numeric_id)
+    fish_df = fish_df.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+
+    recipe_df = pd.concat([s.recipe_breakdown for s in summaries]).groupby("Recipe_ID", as_index=False)["Cooked_Count"].sum()
+    recipe_df["Cooked_Count"] = recipe_df["Cooked_Count"] / num_runs # 총합을 실행 횟수로 나눔
+    recipe_df["_sort_key"] = recipe_df["Recipe_ID"].apply(sort_by_numeric_id)
+    recipe_df = recipe_df.sort_values("_sort_key").drop(columns=["_sort_key"]).reset_index(drop=True)
+
+    return SimSummary(
+        fish_caught=get_avg("fish_caught"),
+        fishing_sessions=get_avg("fishing_sessions"),
+        tickets_spent=get_avg("tickets_spent"),
+        fish_left_in_inventory=get_avg("fish_left_in_inventory"),
+        dishes_cooked=get_avg("dishes_cooked"),
+        dishes_sold=get_avg("dishes_sold"),
+        gross_sales=get_avg("gross_sales"),
+        tips_sales=get_avg("tips_sales"),
+        total_sales=get_avg("total_sales"),
+        customers_spawned=get_avg("customers_spawned"),
+        customers_completed=get_avg("customers_completed"),
+        special_spawned=get_avg("special_spawned"),
+        vip_spawned=get_avg("vip_spawned"),
+        peak_fish_inventory=get_avg("peak_fish_inventory"),
+        peak_dish_stock=get_avg("peak_dish_stock"),
+        remaining_tickets=get_avg("remaining_tickets"),
+        remaining_dishes=get_avg("remaining_dishes"),
+        restaurant_idle_seconds=get_avg("restaurant_idle_seconds"),
+        out_of_stock_seconds=get_avg("out_of_stock_seconds"),
+        bottleneck=common_bottleneck,
+        active_rate_id=summaries[0].active_rate_id,
         rarity_breakdown=rarity_df,
         fish_breakdown=fish_df,
         recipe_breakdown=recipe_df,
@@ -641,7 +733,8 @@ def main() -> None:
         st.divider()
         total_seconds = st.slider("시뮬레이션 시간(초)", 600, SECONDS_PER_DAY * 7, SECONDS_PER_DAY, 600)
         wait_after_full_seconds = st.slider("풀충전 후 대기시간(초)", 0, SECONDS_PER_DAY, 0, 60)
-        seed = st.number_input("랜덤 시드", min_value=0, value=42, step=1)
+        num_runs = st.number_input("시뮬레이션 반복 횟수 (평균)", min_value=1, max_value=100, value=10, step=1)
+        base_seed = st.number_input("시작 랜덤 시드", min_value=0, value=42, step=1)
 
     fishing_id = extract_id(fishing_link)
     restaurant_id = extract_id(restaurant_link)
@@ -677,15 +770,29 @@ def main() -> None:
                 levels[key] = st.slider(key, lo, hi, lo)
 
     levels = clamp_levels(levels)
-    result = run_simulation(tables, levels, total_seconds, wait_after_full_seconds, int(seed))
+    
+    with st.spinner(f"시뮬레이션을 {num_runs}회 반복 실행하며 평균을 계산 중입니다..."):
+        result = run_multiple_simulations(tables, levels, total_seconds, wait_after_full_seconds, int(base_seed), int(num_runs))
 
-    st.info(f"현재 PlayerGrade {levels['PlayerGrade']} → 참조 Rate_ID: **{result.active_rate_id}**")
+    st.info(f"현재 PlayerGrade {levels['PlayerGrade']} → 참조 Rate_ID: **{result.active_rate_id}** (총 {num_runs}회 평균 데이터)")
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("총수익", f"{result.total_sales:,.0f}")
-    m2.metric("총 판매량", f"{result.dishes_sold:,}")
-    m3.metric("낚은 물고기", f"{result.fish_caught:,}")
-    m4.metric("병목", result.bottleneck)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("총수익 (평균)", f"{result.total_sales:,.0f}")
+    m2.metric("팁 수익 (평균)", f"{result.tips_sales:,.0f}")
+    m3.metric("총 판매량 (평균)", f"{result.dishes_sold:,.1f}")
+    m4.metric("낚은 물고기 (평균)", f"{result.fish_caught:,.1f}")
+    m5.metric("주요 병목 현상", result.bottleneck)
+
+    st.markdown("---")
+    st.subheader(f"손님 방문 통계 (평균)")
+    c_m1, c_m2, c_m3, c_m4 = st.columns(4)
+    normal_spawned = result.customers_spawned - result.special_spawned - result.vip_spawned
+    
+    c_m1.metric("총 방문객", f"{result.customers_spawned:,.1f}")
+    c_m2.metric("일반 손님 (Normal)", f"{normal_spawned:,.1f}")
+    c_m3.metric("특수 손님 (Special)", f"{result.special_spawned:,.1f}")
+    c_m4.metric("VIP 손님", f"{result.vip_spawned:,.2f}")
+    st.markdown("---")
 
     summary_df = pd.DataFrame(
         {
@@ -696,26 +803,41 @@ def main() -> None:
                 "Peak Fish Inventory", "Peak Dish Stock", "Out of Stock Seconds", "Restaurant Idle Seconds",
             ],
             "Value": [
-                result.active_rate_id, result.fishing_sessions, result.tickets_spent, result.remaining_tickets,
-                result.fish_left_in_inventory, result.dishes_cooked, result.dishes_sold, result.remaining_dishes,
-                round(result.gross_sales, 2), round(result.tips_sales, 2), round(result.total_sales, 2),
-                result.customers_spawned, result.customers_completed, result.special_spawned, result.vip_spawned,
-                result.peak_fish_inventory, result.peak_dish_stock, result.out_of_stock_seconds, result.restaurant_idle_seconds,
+                result.active_rate_id, 
+                round(result.fishing_sessions, 2), 
+                round(result.tickets_spent, 2), 
+                round(result.remaining_tickets, 2),
+                round(result.fish_left_in_inventory, 2), 
+                round(result.dishes_cooked, 2), 
+                round(result.dishes_sold, 2), 
+                round(result.remaining_dishes, 2),
+                round(result.gross_sales, 2), 
+                round(result.tips_sales, 2), 
+                round(result.total_sales, 2),
+                round(result.customers_spawned, 2), 
+                round(result.customers_completed, 2), 
+                round(result.special_spawned, 2), 
+                round(result.vip_spawned, 2),
+                round(result.peak_fish_inventory, 2), 
+                round(result.peak_dish_stock, 2), 
+                round(result.out_of_stock_seconds, 2), 
+                round(result.restaurant_idle_seconds, 2),
             ],
         }
     )
-    st.dataframe(summary_df, use_container_width=True)
+    with st.expander("시뮬레이션 상세 요약 데이터 보기 (10회 평균값)"):
+        st.dataframe(summary_df, use_container_width=True)
 
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.subheader("등급별 어획")
-        st.dataframe(result.rarity_breakdown, use_container_width=True)
+        st.subheader("등급별 어획 (평균)")
+        st.dataframe(result.rarity_breakdown.round(1), use_container_width=True)
     with c2:
-        st.subheader("물고기별 어획")
-        st.dataframe(result.fish_breakdown, use_container_width=True)
+        st.subheader("물고기별 어획 (평균)")
+        st.dataframe(result.fish_breakdown.round(1), use_container_width=True)
     with c3:
-        st.subheader("레시피 생산량")
-        st.dataframe(result.recipe_breakdown, use_container_width=True)
+        st.subheader("레시피 생산량 (평균)")
+        st.dataframe(result.recipe_breakdown.round(1), use_container_width=True)
 
     with st.expander("원본 데이터 미리보기"):
         tabs = st.tabs(["Fishing_UPG", "Rates", "Fish", "Restaurant_UPG", "Recipes", "Guest_Actions", "Guest_Tips"])
