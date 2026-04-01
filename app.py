@@ -50,6 +50,7 @@ class SimSummary:
     tickets_spent: float
     fish_left_in_inventory: float
     dishes_cooked: float
+    dishes_discarded: float
     dishes_sold: float
     gross_sales: float
     tips_sales: float
@@ -78,7 +79,6 @@ def clean_table(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(how="all").reset_index(drop=True)
 
     header_idx = 0
-    # Menu_UPG_Data 처럼 Upgrade_Type 없이 Level, Cost, Effect_Value_Int만 있는 경우를 대비해 키워드 추가
     keywords = ["Upgrade_Type", "Fish_ID", "Recipe_ID", "Customer_ID", "Gacha_Group_ID", "DishWashTime", "Upgrade", "Type", "Effect_Value_Int", "Level", "Cost"]
     for i in range(min(10, len(out))):
         row_values = [str(x).strip() for x in out.iloc[i].tolist()]
@@ -136,7 +136,6 @@ def load_all_data(fishing_id: str, restaurant_id: str, guest_id: str) -> Dict[st
         "guest_tips": clean_table(guest_sheets["Customer_Tips"]),
     }
     
-    # 메뉴 슬롯 업그레이드 시트 (Menu_UPG_Data) 로드
     if "Menu_UPG_Data" in restaurant_sheets:
         tables["menu_upg"] = clean_table(restaurant_sheets["Menu_UPG_Data"])
     else:
@@ -380,7 +379,6 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     max_special_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_1", levels.get("Max_Spawn_Limit_1", 1), "Effect_Value_Int"))
     max_vip_limit = int(get_upgrade_value(restaurant_upg, "Max_Spawn_Limit_2", levels.get("Max_Spawn_Limit_2", 1), "Effect_Value_Int"))
 
-    # 💡 메뉴 슬롯 제한값 세팅
     menu_upg = tables.get("menu_upg", pd.DataFrame())
     if not menu_upg.empty and "Level" in menu_upg.columns and "Effect_Value_Int" in menu_upg.columns:
         menu_df = to_numeric(menu_upg, ["Level", "Effect_Value_Int"])
@@ -408,6 +406,7 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
     fishing_sessions = 0
     tickets_spent = 0
     dishes_cooked = 0
+    dishes_discarded = 0
     dishes_sold = 0
     gross_sales = 0.0
     tips_sales = 0.0
@@ -454,20 +453,25 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
             fish_inventory.pop(fish_id, None)
         peak_dish_stock = max(peak_dish_stock, total_dish_inventory())
 
+    def manage_menu_and_discard() -> None:
+        nonlocal dishes_discarded
+        available_rids = [rid for rid, cnt in dish_inventory.items() if cnt > 0]
+        if len(available_rids) <= max_menu_slots:
+            return
+            
+        available_rids.sort(key=lambda x: recipe_price.get(x, 0.0) * dish_inventory[x], reverse=True)
+        
+        discard_rids = available_rids[max_menu_slots:]
+        for rid in discard_rids:
+            dishes_discarded += dish_inventory[rid]
+            del dish_inventory[rid]
+
     def consume_random_dish() -> Optional[str]:
-        # 재고가 있는 전체 메뉴 리스트
         available = [rid for rid, cnt in dish_inventory.items() if cnt > 0]
         if not available:
             return None
             
-        # 💡 최적의 플레이어를 모방하여 가격이 가장 비싼 순으로 내림차순 정렬
-        available.sort(key=lambda x: recipe_price.get(x, 0.0), reverse=True)
-        
-        # 현재 메뉴판(Menu Slots)에 등록된 요리들 (최대 N개 제한)
-        current_menu = available[:max_menu_slots]
-        
-        # 손님은 "메뉴판에 있는" 요리 중 하나를 무작위로 선택함
-        rid = rng.choice(current_menu)
+        rid = rng.choice(available)
         dish_inventory[rid] -= 1
         
         if dish_inventory[rid] <= 0:
@@ -548,7 +552,10 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
             tickets -= casts
             tickets_spent += casts
             peak_fish_inventory = max(peak_fish_inventory, total_fish_inventory())
+            
             convert_all_fish_to_dishes()
+            manage_menu_and_discard() 
+            
             next_visit_at = None
             if tickets >= rod_capacity:
                 next_visit_at = t + wait_after_full_seconds
@@ -673,6 +680,7 @@ def run_simulation(tables: Dict[str, pd.DataFrame], levels: Dict[str, int], tota
         tickets_spent=float(tickets_spent),
         fish_left_in_inventory=float(fish_left_in_inventory),
         dishes_cooked=float(dishes_cooked),
+        dishes_discarded=float(dishes_discarded),
         dishes_sold=float(dishes_sold),
         gross_sales=float(gross_sales),
         tips_sales=float(tips_sales),
@@ -739,6 +747,7 @@ def run_multiple_simulations(tables: Dict[str, pd.DataFrame], levels: Dict[str, 
         tickets_spent=get_avg("tickets_spent"),
         fish_left_in_inventory=get_avg("fish_left_in_inventory"),
         dishes_cooked=get_avg("dishes_cooked"),
+        dishes_discarded=get_avg("dishes_discarded"),
         dishes_sold=get_avg("dishes_sold"),
         gross_sales=get_avg("gross_sales"),
         tips_sales=get_avg("tips_sales"),
@@ -811,7 +820,6 @@ def main() -> None:
     with col2:
         st.subheader("Restaurant")
         
-        # 💡 메뉴 슬롯 업그레이드 슬라이더 추가
         if "menu_upg" in tables and not tables["menu_upg"].empty:
             menu_df = to_numeric(tables["menu_upg"], ["Level"])
             menu_max = menu_df["Level"].max() if not menu_df["Level"].dropna().empty else 9
@@ -834,15 +842,16 @@ def main() -> None:
 
     st.info(f"현재 PlayerGrade {levels.get('PlayerGrade', 1)} → 참조 Rate_ID: **{result.active_rate_id}** (총 {num_runs}회 평균 데이터)")
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3, m4, m5, m6 = st.columns(6)
     m1.metric("총수익 (평균)", f"{result.total_sales:,.0f}")
     m2.metric("팁 수익 (평균)", f"{result.tips_sales:,.0f}")
     m3.metric("총 판매량 (평균)", f"{result.dishes_sold:,.1f}")
-    m4.metric("낚은 물고기 (평균)", f"{result.fish_caught:,.1f}")
-    m5.metric("주요 병목 현상", result.bottleneck)
+    m4.metric("폐기된 음식 (평균)", f"{result.dishes_discarded:,.1f}")  
+    m5.metric("낚은 물고기 (평균)", f"{result.fish_caught:,.1f}")
+    m6.metric("주요 병목 현상", result.bottleneck)
 
     st.markdown("---")
-    st.subheader(f"손님 방문 통계 (평균)")
+    st.subheader(f"손닙 방문 통계 (평균)")
     c_m1, c_m2, c_m3, c_m4 = st.columns(4)
     normal_spawned = result.customers_spawned - result.special_spawned - result.vip_spawned
     
@@ -856,7 +865,7 @@ def main() -> None:
         {
             "Metric": [
                 "Active Rate_ID", "Fishing Sessions", "Tickets Spent", "Remaining Tickets", "Fish Left Inventory",
-                "Dishes Cooked", "Dishes Sold", "Remaining Dishes", "Gross Sales", "Tips Sales", "Total Sales",
+                "Dishes Cooked", "Dishes Sold", "Dishes Discarded", "Remaining Dishes", "Gross Sales", "Tips Sales", "Total Sales",
                 "Customers Spawned", "Customers Completed", "Special Spawned", "VIP Spawned",
                 "Peak Fish Inventory", "Peak Dish Stock", "Out of Stock Seconds", "Restaurant Idle Seconds",
             ],
@@ -868,6 +877,7 @@ def main() -> None:
                 round(result.fish_left_in_inventory, 2), 
                 round(result.dishes_cooked, 2), 
                 round(result.dishes_sold, 2), 
+                round(result.dishes_discarded, 2),
                 round(result.remaining_dishes, 2),
                 round(result.gross_sales, 2), 
                 round(result.tips_sales, 2), 
