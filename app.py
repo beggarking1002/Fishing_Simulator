@@ -789,7 +789,7 @@ def main() -> None:
         guest_link = st.text_input("Customer Data URL", value="https://docs.google.com/spreadsheets/d/1YO5eyJvc26dD0JXTYaJRWGz3gd9cQnqkOjO23i0SKVc/edit?usp=drive_link")
 
         st.divider()
-        total_seconds = st.slider("시뮬레이션 시간(초)", 600, SECONDS_PER_DAY * 7, SECONDS_PER_DAY, 600)
+        total_seconds = st.number_input("시뮬레이션 시간(초)", min_value=600, max_value=SECONDS_PER_DAY * 7, value=SECONDS_PER_DAY, step=600)
         wait_after_full_seconds = st.slider("풀충전 후 대기시간(초)", 0, SECONDS_PER_DAY, 0, 60)
         num_runs = st.number_input("시뮬레이션 반복 횟수 (평균)", min_value=1, max_value=100, value=10, step=1)
         base_seed = st.number_input("시작 랜덤 시드", min_value=0, value=42, step=1)
